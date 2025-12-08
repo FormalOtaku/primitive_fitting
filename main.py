@@ -7,11 +7,148 @@ CLI tool for fitting plane and cylinder primitives to point cloud data.
 
 import argparse
 import json
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 import numpy as np
 import open3d as o3d
+
+
+# =============================================================================
+# Sensor Profile System
+# =============================================================================
+
+@dataclass
+class SensorProfile:
+    """
+    Configuration profile for specific sensor/map combinations.
+
+    Attributes:
+        name: Human-readable profile name
+        voxel_size: Voxel size for downsampling
+        r_min: Minimum ROI radius for adaptive selection
+        r_max: Maximum ROI radius for adaptive selection
+        r_step: Step size to increase radius when points are insufficient
+        min_points: Minimum number of points required in ROI
+        plane_distance_threshold: RANSAC distance threshold for plane fitting
+        cylinder_distance_threshold: RANSAC distance threshold for cylinder fitting
+    """
+    name: str
+    voxel_size: float = 0.01
+    r_min: float = 0.2
+    r_max: float = 1.0
+    r_step: float = 0.1
+    min_points: int = 80
+    plane_distance_threshold: float = 0.01
+    cylinder_distance_threshold: float = 0.02
+
+
+# Built-in sensor profiles
+SENSOR_PROFILES: Dict[str, SensorProfile] = {
+    "default": SensorProfile(
+        name="Default",
+        voxel_size=0.01,
+        r_min=0.2,
+        r_max=0.5,
+        r_step=0.1,
+        min_points=50,
+        plane_distance_threshold=0.01,
+        cylinder_distance_threshold=0.02,
+    ),
+    "mid70_map": SensorProfile(
+        name="Livox Mid-70 (FAST-LIO2 Map)",
+        voxel_size=0.05,
+        r_min=0.2,
+        r_max=1.0,
+        r_step=0.1,
+        min_points=80,
+        plane_distance_threshold=0.02,
+        cylinder_distance_threshold=0.03,
+    ),
+    "mid70_dense": SensorProfile(
+        name="Livox Mid-70 (Dense Scan)",
+        voxel_size=0.02,
+        r_min=0.1,
+        r_max=0.5,
+        r_step=0.05,
+        min_points=100,
+        plane_distance_threshold=0.01,
+        cylinder_distance_threshold=0.02,
+    ),
+    "velodyne_map": SensorProfile(
+        name="Velodyne (Map)",
+        voxel_size=0.05,
+        r_min=0.3,
+        r_max=1.5,
+        r_step=0.15,
+        min_points=60,
+        plane_distance_threshold=0.03,
+        cylinder_distance_threshold=0.04,
+    ),
+}
+
+# tkinter availability check (lazy import)
+_TKINTER_AVAILABLE: Optional[bool] = None
+
+
+def _check_tkinter() -> bool:
+    """Check if tkinter is available."""
+    global _TKINTER_AVAILABLE
+    if _TKINTER_AVAILABLE is None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            # Test that we can actually create a root window
+            root = tk.Tk()
+            root.withdraw()
+            root.destroy()
+            _TKINTER_AVAILABLE = True
+        except Exception:
+            _TKINTER_AVAILABLE = False
+    return _TKINTER_AVAILABLE
+
+
+def select_file_with_dialog() -> Optional[str]:
+    """
+    Open a file dialog to select a point cloud file.
+
+    Returns:
+        Selected file path, or None if cancelled.
+
+    Raises:
+        RuntimeError: If tkinter is not available.
+    """
+    if not _check_tkinter():
+        raise RuntimeError(
+            "tkinter is not available. "
+            "Please install tkinter or use --input to specify the file path."
+        )
+
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    root.attributes('-topmost', True)  # Bring dialog to front
+
+    filepath = filedialog.askopenfilename(
+        title="Select Point Cloud File",
+        filetypes=[
+            ("Point Cloud Files", "*.pcd *.ply"),
+            ("PCD Files", "*.pcd"),
+            ("PLY Files", "*.ply"),
+            ("All Files", "*.*"),
+        ],
+        initialdir=Path.home(),
+    )
+
+    root.destroy()
+
+    if filepath:
+        return filepath
+    return None
 
 from primitives import fit_plane, fit_cylinder, PlaneParam, CylinderParam
 
@@ -84,6 +221,16 @@ def preprocess_point_cloud(
 # ROI Selection
 # =============================================================================
 
+@dataclass
+class AdaptiveROIResult:
+    """Result of adaptive ROI selection."""
+    roi_pcd: Optional[o3d.geometry.PointCloud]
+    final_radius: float
+    point_count: int
+    success: bool
+    message: str
+
+
 class ROISelector:
     """Interactive ROI selection using Open3D visualizer."""
 
@@ -91,6 +238,112 @@ class ROISelector:
         self.pcd = pcd
         self.selected_indices: Optional[np.ndarray] = None
         self.vis = None
+        self._pcd_tree: Optional[o3d.geometry.KDTreeFlann] = None
+
+    def _get_kdtree(self) -> o3d.geometry.KDTreeFlann:
+        """Lazily build and cache KD-tree."""
+        if self._pcd_tree is None:
+            self._pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+        return self._pcd_tree
+
+    def select_roi_adaptive(
+        self,
+        r_min: float = 0.2,
+        r_max: float = 1.0,
+        r_step: float = 0.1,
+        min_points: int = 80
+    ) -> AdaptiveROIResult:
+        """
+        Select ROI with adaptive radius expansion based on point density.
+
+        The radius starts at r_min and expands by r_step until either:
+        - min_points are found in the ROI, or
+        - r_max is exceeded (returns warning)
+
+        Args:
+            r_min: Initial/minimum radius
+            r_max: Maximum allowed radius
+            r_step: Step size for radius expansion
+            min_points: Minimum points required in ROI
+
+        Returns:
+            AdaptiveROIResult containing ROI point cloud and metadata
+        """
+        print("\n=== ROI Selection Mode (Adaptive Radius) ===")
+        print(f"Parameters: r_min={r_min}m, r_max={r_max}m, step={r_step}m, min_points={min_points}")
+        print("1. Shift + Left Click to pick a center point")
+        print("2. Press 'Q' to confirm selection")
+        print("3. Press 'Escape' to cancel")
+
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window("Select ROI Center Point")
+        vis.add_geometry(self.pcd)
+        vis.run()
+        vis.destroy_window()
+
+        picked_indices = vis.get_picked_points()
+
+        if len(picked_indices) == 0:
+            return AdaptiveROIResult(
+                roi_pcd=None,
+                final_radius=0.0,
+                point_count=0,
+                success=False,
+                message="No point selected, cancelling..."
+            )
+
+        # Get the first picked point as center
+        center_idx = picked_indices[0]
+        center_point = np.asarray(self.pcd.points)[center_idx]
+        print(f"Selected center point: {center_point}")
+
+        # Adaptive radius expansion
+        pcd_tree = self._get_kdtree()
+        current_radius = r_min
+        point_count = 0
+        idx = []
+
+        while current_radius <= r_max:
+            [k, idx, _] = pcd_tree.search_radius_vector_3d(center_point, current_radius)
+            point_count = k
+
+            if point_count >= min_points:
+                break
+
+            print(f"  Radius {current_radius:.2f}m: {point_count} points (< {min_points}), expanding...")
+            current_radius += r_step
+
+        # Check if we exceeded r_max without finding enough points
+        if point_count < min_points:
+            msg = (
+                f"WARNING: ROI is too sparse. Found only {point_count} points "
+                f"at maximum radius {r_max}m (required: {min_points}). "
+                "Fitting may be unreliable or skipped."
+            )
+            print(f"\n{msg}")
+            if point_count == 0:
+                return AdaptiveROIResult(
+                    roi_pcd=None,
+                    final_radius=current_radius,
+                    point_count=0,
+                    success=False,
+                    message=msg
+                )
+
+        self.selected_indices = np.array(idx)
+        roi_pcd = self.pcd.select_by_index(self.selected_indices)
+
+        # Log final ROI radius
+        final_radius = min(current_radius, r_max)
+        print(f"\nFinal ROI radius: {final_radius:.2f} m, points in ROI: {len(roi_pcd.points)}")
+
+        return AdaptiveROIResult(
+            roi_pcd=roi_pcd,
+            final_radius=final_radius,
+            point_count=len(roi_pcd.points),
+            success=point_count >= min_points,
+            message=f"ROI selected with {len(roi_pcd.points)} points at radius {final_radius:.2f}m"
+        )
 
     def select_roi_picking(self, radius: float = 0.1) -> Optional[o3d.geometry.PointCloud]:
         """
@@ -125,7 +378,7 @@ class ROISelector:
         print(f"Selected center point: {center_point}")
 
         # Find all points within radius
-        pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+        pcd_tree = self._get_kdtree()
         [k, idx, _] = pcd_tree.search_radius_vector_3d(center_point, radius)
 
         if k == 0:
@@ -342,22 +595,29 @@ def append_cylinder_result(results: dict, cylinder: CylinderParam) -> dict:
 # Main Application
 # =============================================================================
 
+def list_sensor_profiles() -> str:
+    """Return a formatted string listing available sensor profiles."""
+    lines = ["Available sensor profiles:"]
+    for key, profile in SENSOR_PROFILES.items():
+        lines.append(f"  {key}: {profile.name}")
+        lines.append(f"      voxel_size={profile.voxel_size}, r_min={profile.r_min}, "
+                     f"r_max={profile.r_max}, min_points={profile.min_points}")
+    return "\n".join(lines)
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Primitive Fitting Tool for LiDAR point clouds"
+        description="Primitive Fitting Tool for LiDAR point clouds",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=list_sensor_profiles()
     )
     parser.add_argument(
         "--input", "-i",
         type=str,
-        required=True,
-        help="Path to input PCD or PLY file"
-    )
-    parser.add_argument(
-        "--voxel_size",
-        type=float,
-        default=0.01,
-        help="Voxel size for downsampling (default: 0.01, 0 to skip)"
+        required=False,
+        default=None,
+        help="Path to input PCD or PLY file (optional: opens file dialog if not specified)"
     )
     parser.add_argument(
         "--output", "-o",
@@ -365,18 +625,236 @@ def parse_args():
         default="fit_results.json",
         help="Output JSON file for results (default: fit_results.json)"
     )
+
+    # Sensor profile
+    parser.add_argument(
+        "--sensor-profile",
+        type=str,
+        default=None,
+        choices=list(SENSOR_PROFILES.keys()),
+        metavar="PROFILE",
+        help=f"Sensor profile to use. Available: {', '.join(SENSOR_PROFILES.keys())}"
+    )
+
+    # Preprocessing options (can override profile)
+    parser.add_argument(
+        "--voxel-size",
+        type=float,
+        default=None,
+        help="Voxel size for downsampling (overrides profile setting)"
+    )
+    parser.add_argument(
+        "--no-preprocess",
+        action="store_true",
+        dest="no_preprocess",
+        help="Skip preprocessing (downsampling, outlier removal)"
+    )
+
+    # ROI adaptive radius options (can override profile)
+    roi_group = parser.add_argument_group("ROI Adaptive Radius Options")
+    roi_group.add_argument(
+        "--roi-r-min",
+        type=float,
+        default=None,
+        help="Minimum ROI radius in meters (overrides profile)"
+    )
+    roi_group.add_argument(
+        "--roi-r-max",
+        type=float,
+        default=None,
+        help="Maximum ROI radius in meters (overrides profile)"
+    )
+    roi_group.add_argument(
+        "--roi-r-step",
+        type=float,
+        default=None,
+        help="ROI radius step size in meters (overrides profile)"
+    )
+    roi_group.add_argument(
+        "--roi-min-points",
+        type=int,
+        default=None,
+        help="Minimum points required in ROI (overrides profile)"
+    )
+    roi_group.add_argument(
+        "--no-adaptive-roi",
+        action="store_true",
+        dest="no_adaptive_roi",
+        help="Disable adaptive ROI, use fixed radius from --roi-r-min"
+    )
+
+    # RANSAC thresholds (can override profile)
+    ransac_group = parser.add_argument_group("RANSAC Options")
+    ransac_group.add_argument(
+        "--plane-threshold",
+        type=float,
+        default=None,
+        help="Distance threshold for plane RANSAC (overrides profile)"
+    )
+    ransac_group.add_argument(
+        "--cylinder-threshold",
+        type=float,
+        default=None,
+        help="Distance threshold for cylinder RANSAC (overrides profile)"
+    )
+
+    # Legacy argument for backward compatibility
     parser.add_argument(
         "--roi_radius",
         type=float,
-        default=0.2,
-        help="Radius for ROI selection around picked point (default: 0.2)"
+        default=None,
+        help=argparse.SUPPRESS  # Hidden, for backward compatibility
+    )
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS  # Hidden, for backward compatibility
     )
     parser.add_argument(
         "--no_preprocess",
         action="store_true",
-        help="Skip preprocessing (downsampling, outlier removal)"
+        dest="no_preprocess_legacy",
+        help=argparse.SUPPRESS
     )
+
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        dest="no_gui",
+        help="Disable GUI file dialog (requires --input to be specified)"
+    )
+
     return parser.parse_args()
+
+
+def build_effective_config(args) -> Tuple[SensorProfile, dict]:
+    """
+    Build effective configuration by merging profile defaults with CLI overrides.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        Tuple of (effective SensorProfile, additional config dict)
+    """
+    # Start with default or specified profile
+    if args.sensor_profile:
+        profile = SENSOR_PROFILES[args.sensor_profile]
+        print(f"Using sensor profile: {profile.name}")
+    else:
+        profile = SENSOR_PROFILES["default"]
+
+    # Create a mutable copy of profile values
+    config = {
+        "voxel_size": profile.voxel_size,
+        "r_min": profile.r_min,
+        "r_max": profile.r_max,
+        "r_step": profile.r_step,
+        "min_points": profile.min_points,
+        "plane_distance_threshold": profile.plane_distance_threshold,
+        "cylinder_distance_threshold": profile.cylinder_distance_threshold,
+    }
+
+    # Apply CLI overrides
+    # Handle both new and legacy voxel_size arguments
+    if args.voxel_size is not None:
+        config["voxel_size"] = args.voxel_size
+
+    if args.roi_r_min is not None:
+        config["r_min"] = args.roi_r_min
+    elif args.roi_radius is not None:  # Legacy fallback
+        config["r_min"] = args.roi_radius
+
+    if args.roi_r_max is not None:
+        config["r_max"] = args.roi_r_max
+
+    if args.roi_r_step is not None:
+        config["r_step"] = args.roi_r_step
+
+    if args.roi_min_points is not None:
+        config["min_points"] = args.roi_min_points
+
+    if args.plane_threshold is not None:
+        config["plane_distance_threshold"] = args.plane_threshold
+
+    if args.cylinder_threshold is not None:
+        config["cylinder_distance_threshold"] = args.cylinder_threshold
+
+    # Handle legacy no_preprocess
+    no_preprocess = args.no_preprocess or getattr(args, 'no_preprocess_legacy', False)
+
+    extra_config = {
+        "no_preprocess": no_preprocess,
+        "no_adaptive_roi": args.no_adaptive_roi,
+    }
+
+    # Print effective configuration
+    print("\nEffective configuration:")
+    print(f"  Voxel size: {config['voxel_size']}")
+    print(f"  ROI: r_min={config['r_min']}m, r_max={config['r_max']}m, "
+          f"step={config['r_step']}m, min_points={config['min_points']}")
+    print(f"  RANSAC thresholds: plane={config['plane_distance_threshold']}, "
+          f"cylinder={config['cylinder_distance_threshold']}")
+    if extra_config["no_adaptive_roi"]:
+        print(f"  Adaptive ROI: DISABLED (fixed radius: {config['r_min']}m)")
+    else:
+        print("  Adaptive ROI: ENABLED")
+
+    # Create effective profile
+    effective_profile = SensorProfile(
+        name=f"{profile.name} (with overrides)" if args.sensor_profile else "Custom",
+        voxel_size=config["voxel_size"],
+        r_min=config["r_min"],
+        r_max=config["r_max"],
+        r_step=config["r_step"],
+        min_points=config["min_points"],
+        plane_distance_threshold=config["plane_distance_threshold"],
+        cylinder_distance_threshold=config["cylinder_distance_threshold"],
+    )
+
+    return effective_profile, extra_config
+
+
+def resolve_input_file(args) -> str:
+    """
+    Resolve the input file path from args or file dialog.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        Path to the input file.
+
+    Raises:
+        SystemExit: If no file is specified/selected or required conditions not met.
+    """
+    # Case 1: --input is specified
+    if args.input is not None:
+        return args.input
+
+    # Case 2: --no-gui is specified but --input is not
+    if args.no_gui:
+        print("Error: --no-gui requires --input to be specified.", file=sys.stderr)
+        sys.exit(1)
+
+    # Case 3: Try to open file dialog
+    if not _check_tkinter():
+        print(
+            "Warning: tkinter is not available for file dialog.\n"
+            "Please specify the input file with --input option.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    print("No input file specified. Opening file dialog...")
+    filepath = select_file_with_dialog()
+
+    if filepath is None:
+        print("No file selected. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    return filepath
 
 
 def prompt_primitive_type() -> str:
@@ -396,14 +874,20 @@ def main():
     """Main entry point."""
     args = parse_args()
 
+    # Build effective configuration from profile and CLI overrides
+    profile, extra_config = build_effective_config(args)
+
+    # Resolve input file (from args or file dialog)
+    input_file = resolve_input_file(args)
+
     # Load point cloud
-    print(f"\nLoading point cloud from {args.input}...")
-    pcd = load_point_cloud(args.input)
+    print(f"\nLoading point cloud from {input_file}...")
+    pcd = load_point_cloud(input_file)
 
     # Preprocess
-    if not args.no_preprocess:
+    if not extra_config["no_preprocess"]:
         print("\nPreprocessing point cloud...")
-        pcd = preprocess_point_cloud(pcd, voxel_size=args.voxel_size)
+        pcd = preprocess_point_cloud(pcd, voxel_size=profile.voxel_size)
 
     # Load existing results
     results = load_results(args.output)
@@ -423,13 +907,37 @@ def main():
         if primitive_type == 'q':
             break
 
-        # Select ROI
-        print(f"\nSelecting ROI (radius: {args.roi_radius})...")
-        roi_pcd = roi_selector.select_roi_picking(radius=args.roi_radius)
+        # Select ROI (adaptive or fixed)
+        if extra_config["no_adaptive_roi"]:
+            # Fixed radius mode (legacy behavior)
+            print(f"\nSelecting ROI (fixed radius: {profile.r_min}m)...")
+            roi_pcd = roi_selector.select_roi_picking(radius=profile.r_min)
+            roi_result = None
+            if roi_pcd is None or roi_pcd.is_empty():
+                print("ROI selection cancelled or empty")
+                continue
+        else:
+            # Adaptive radius mode
+            roi_result = roi_selector.select_roi_adaptive(
+                r_min=profile.r_min,
+                r_max=profile.r_max,
+                r_step=profile.r_step,
+                min_points=profile.min_points
+            )
 
-        if roi_pcd is None or roi_pcd.is_empty():
-            print("ROI selection cancelled or empty")
-            continue
+            if roi_result.roi_pcd is None or roi_result.point_count == 0:
+                print(roi_result.message)
+                continue
+
+            roi_pcd = roi_result.roi_pcd
+
+            # Warn and optionally skip if ROI is too sparse
+            if not roi_result.success:
+                print("\nWARNING: ROI has fewer points than required.")
+                proceed = input("Proceed with fitting anyway? [y/n]: ").strip().lower()
+                if proceed != 'y':
+                    print("Skipping fitting for this ROI.")
+                    continue
 
         # Get points and normals from ROI
         points = np.asarray(roi_pcd.points)
@@ -438,7 +946,10 @@ def main():
         # Fit primitive
         if primitive_type == 'p':
             print("\nFitting plane...")
-            plane = fit_plane(points)
+            plane = fit_plane(
+                points,
+                distance_threshold=profile.plane_distance_threshold
+            )
             if plane is not None:
                 print(
                     "Plane fit OK | normal="
@@ -453,7 +964,11 @@ def main():
 
         elif primitive_type == 'c':
             print("\nFitting cylinder...")
-            cylinder = fit_cylinder(points, normals)
+            cylinder = fit_cylinder(
+                points,
+                normals,
+                distance_threshold=profile.cylinder_distance_threshold
+            )
             if cylinder is not None:
                 print(
                     "Cylinder fit OK | axis_point="
