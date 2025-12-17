@@ -21,6 +21,8 @@ from primitives import (
     SeedExpandPlaneResult, SeedExpandCylinderResult
 )
 
+SEED_EXPAND_RESULT_VERSION = 2
+
 
 # =============================================================================
 # Sensor Profile System
@@ -1199,7 +1201,49 @@ def parse_args():
         "--max-refine-iters",
         type=int,
         default=3,
-        help="Number of plane refit iterations after expansion (default: 3)"
+        help="Number of refit iterations after expansion (plane: up to N, cylinder: up to 2) (default: 3)"
+    )
+    seed_group.add_argument(
+        "--max-expanded-points",
+        type=int,
+        default=200_000,
+        help="Hard cap on expanded inlier points (default: 200000)"
+    )
+    seed_group.add_argument(
+        "--max-frontier",
+        type=int,
+        default=200_000,
+        help="Hard cap on BFS frontier size (default: 200000)"
+    )
+    seed_group.add_argument(
+        "--max-steps",
+        type=int,
+        default=1_000_000,
+        help="Hard cap on BFS steps (default: 1000000)"
+    )
+    seed_group.add_argument(
+        "--adaptive-plane-refine-th",
+        action="store_true",
+        dest="adaptive_plane_refine_th",
+        help="Adapt plane distance threshold during refinement using median/MAD (default: off)"
+    )
+    seed_group.add_argument(
+        "--adaptive-plane-refine-k",
+        type=float,
+        default=3.0,
+        help="k for adaptive thresholding: median + k*sigma(MAD) (default: 3.0)"
+    )
+    seed_group.add_argument(
+        "--adaptive-plane-refine-min-scale",
+        type=float,
+        default=0.5,
+        help="Minimum adaptive threshold scale of plane threshold (default: 0.5)"
+    )
+    seed_group.add_argument(
+        "--adaptive-plane-refine-max-scale",
+        type=float,
+        default=1.5,
+        help="Maximum adaptive threshold scale of plane threshold (default: 1.5)"
     )
     seed_group.add_argument(
         "--normal-th",
@@ -1514,16 +1558,35 @@ def save_seed_expand_result(
     result,
     primitive_type: str,
     filepath: str,
-    seed_center: np.ndarray
+    seed_center: np.ndarray,
+    params: dict,
 ):
     """Save seed-expand result to JSON."""
     data = {
         "mode": "seed_expand",
+        "version": SEED_EXPAND_RESULT_VERSION,
         "primitive_type": primitive_type,
         "seed_center": seed_center.tolist(),
         "success": result.success,
         "message": result.message,
         "expanded_inlier_count": result.expanded_inlier_count,
+        "seed_point_count": int(getattr(result, "seed_point_count", 0)),
+        "candidate_count": int(getattr(result, "candidate_count", 0)),
+        "stopped_early": bool(getattr(result, "stopped_early", False)),
+        "stop_reason": str(getattr(result, "stop_reason", "")),
+        "params": params,
+        "seed": {
+            "center": seed_center.tolist(),
+            "radius": float(params.get("seed_radius", 0.0)),
+            "point_count": int(getattr(result, "seed_point_count", 0)),
+        },
+        "stats": {
+            "steps": int(getattr(result, "steps", 0)),
+            "max_frontier_size": int(getattr(result, "max_frontier_size", 0)),
+            "residual_median": float(getattr(result, "residual_median", 0.0)),
+            "residual_p90": float(getattr(result, "residual_p90", 0.0)),
+            "residual_p95": float(getattr(result, "residual_p95", 0.0)),
+        },
     }
 
     if primitive_type == "plane" and result.plane is not None:
@@ -1567,9 +1630,18 @@ def run_seed_expand_mode(
     print(f"  Grow radius: {args.grow_radius}m")
     print(f"  Expand method: {args.expand_method}")
     print(f"  Max refine iterations: {args.max_refine_iters}")
+    print(f"  Max expanded points: {args.max_expanded_points}")
+    print(f"  Max frontier: {args.max_frontier}")
+    print(f"  Max steps: {args.max_steps}")
     print(f"  Normal threshold: {args.normal_th}°")
     print(f"  Plane threshold: {profile.plane_distance_threshold}m")
     print(f"  Cylinder threshold: {profile.cylinder_distance_threshold}m")
+    print(
+        "  Adaptive plane refine threshold: "
+        f"{'on' if args.adaptive_plane_refine_th else 'off'}"
+        f" (k={args.adaptive_plane_refine_k}, "
+        f"scale={args.adaptive_plane_refine_min_scale}..{args.adaptive_plane_refine_max_scale})"
+    )
 
     # Get all points and normals
     all_points = np.asarray(pcd.points)
@@ -1613,6 +1685,24 @@ def run_seed_expand_mode(
         return
 
     output_file = args.seed_output or "seed_expand_results.json"
+    seed_params = {
+        "sensor_profile": profile.name,
+        "seed_radius": args.seed_radius,
+        "max_expand_radius": args.max_expand_radius,
+        "grow_radius": args.grow_radius,
+        "expand_method": args.expand_method,
+        "max_refine_iters": args.max_refine_iters,
+        "max_expanded_points": args.max_expanded_points,
+        "max_frontier": args.max_frontier,
+        "max_steps": args.max_steps,
+        "normal_threshold_deg": args.normal_th,
+        "plane_distance_threshold": profile.plane_distance_threshold,
+        "cylinder_distance_threshold": profile.cylinder_distance_threshold,
+        "adaptive_plane_refine_threshold": args.adaptive_plane_refine_th,
+        "adaptive_plane_refine_k": args.adaptive_plane_refine_k,
+        "adaptive_plane_refine_min_scale": args.adaptive_plane_refine_min_scale,
+        "adaptive_plane_refine_max_scale": args.adaptive_plane_refine_max_scale,
+    }
 
     if choice == 'p':
         # Plane seed-expand
@@ -1628,6 +1718,13 @@ def run_seed_expand_mode(
             normal_threshold_deg=args.normal_th,
             expand_method=args.expand_method,
             max_refine_iters=args.max_refine_iters,
+            adaptive_refine_threshold=args.adaptive_plane_refine_th,
+            adaptive_refine_k=args.adaptive_plane_refine_k,
+            adaptive_refine_min_scale=args.adaptive_plane_refine_min_scale,
+            adaptive_refine_max_scale=args.adaptive_plane_refine_max_scale,
+            max_expanded_points=args.max_expanded_points,
+            max_frontier=args.max_frontier,
+            max_steps=args.max_steps,
             verbose=True
         )
 
@@ -1644,7 +1741,7 @@ def run_seed_expand_mode(
             visualize_seed_expand_plane(pcd, result, seed_center, all_points)
 
             # Save results
-            save_seed_expand_result(result, "plane", output_file, seed_center)
+            save_seed_expand_result(result, "plane", output_file, seed_center, seed_params)
 
             # Export inliers if requested
             if args.export_inliers and result.expanded_inlier_indices is not None:
@@ -1668,6 +1765,10 @@ def run_seed_expand_mode(
             distance_threshold=profile.cylinder_distance_threshold,
             normal_threshold_deg=args.normal_th,
             expand_method=args.expand_method,
+            max_refine_iters=args.max_refine_iters,
+            max_expanded_points=args.max_expanded_points,
+            max_frontier=args.max_frontier,
+            max_steps=args.max_steps,
             verbose=True
         )
 
@@ -1684,7 +1785,7 @@ def run_seed_expand_mode(
             visualize_seed_expand_cylinder(pcd, result, seed_center, all_points)
 
             # Save results
-            save_seed_expand_result(result, "cylinder", output_file, seed_center)
+            save_seed_expand_result(result, "cylinder", output_file, seed_center, seed_params)
 
             # Export inliers if requested
             if args.export_inliers and result.expanded_inlier_indices is not None:

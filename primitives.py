@@ -2,7 +2,9 @@
 primitives.py - Primitive fitting functions for plane and cylinder
 """
 
+from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Optional, List
 import numpy as np
 import open3d as o3d
@@ -27,6 +29,17 @@ class CylinderParam:
     length: float
     inlier_count: int
     inlier_indices: Optional[np.ndarray] = None
+
+
+def _orient_direction(vec: np.ndarray, *, prefer_positive_z: bool) -> np.ndarray:
+    """Return vec or -vec with a deterministic sign convention."""
+    vec = np.asarray(vec, dtype=float)
+    if vec.shape != (3,):
+        vec = vec.reshape(3)
+    if prefer_positive_z:
+        return vec if vec[2] >= 0 else -vec
+    dominant = int(np.argmax(np.abs(vec)))
+    return vec if vec[dominant] >= 0 else -vec
 
 
 def fit_plane(
@@ -65,14 +78,19 @@ def fit_plane(
     if len(inliers) == 0:
         return None
 
-    normal = np.asarray(plane_model[:3], dtype=float)
-    normal_norm = np.linalg.norm(normal)
-    if normal_norm == 0:
+    plane_normal = np.asarray(plane_model[:3], dtype=float)
+    normal_norm = np.linalg.norm(plane_normal)
+    if not np.isfinite(normal_norm) or normal_norm < 1e-12:
         return None
-    normal = normal / normal_norm
+    normal = plane_normal / normal_norm
 
     inlier_points = points[inliers]
-    point_on_plane = inlier_points.mean(axis=0)
+    centroid = inlier_points.mean(axis=0)
+    d = float(plane_model[3]) / float(normal_norm)
+    # Project centroid onto the RANSAC plane to get a point guaranteed to lie on the plane.
+    point_on_plane = centroid - (normal @ centroid + d) * normal
+
+    normal = _orient_direction(normal, prefer_positive_z=True)
 
     return PlaneParam(
         normal=normal,
@@ -171,6 +189,7 @@ def fit_cylinder(
     _, _, vh = np.linalg.svd(centered)
     axis_direction = vh[0]
     axis_direction /= np.linalg.norm(axis_direction)
+    axis_direction = _orient_direction(axis_direction, prefer_positive_z=False)
 
     projections, radial_distances, radial_vec = compute_axis_metrics(centroid, axis_direction)
     radius = float(np.median(radial_distances[best_inliers]))
@@ -587,6 +606,15 @@ class SeedExpandPlaneResult:
     seed_inlier_indices: Optional[np.ndarray]
     success: bool
     message: str
+    seed_point_count: int = 0
+    candidate_count: int = 0
+    stopped_early: bool = False
+    stop_reason: str = ""
+    steps: int = 0
+    max_frontier_size: int = 0
+    residual_median: float = 0.0
+    residual_p90: float = 0.0
+    residual_p95: float = 0.0
 
 
 def expand_plane_from_seed(
@@ -601,6 +629,13 @@ def expand_plane_from_seed(
     normal_threshold_deg: float = 30.0,
     expand_method: str = "component",
     max_refine_iters: int = 3,
+    adaptive_refine_threshold: bool = False,
+    adaptive_refine_k: float = 3.0,
+    adaptive_refine_min_scale: float = 0.5,
+    adaptive_refine_max_scale: float = 1.5,
+    max_expanded_points: int = 200_000,
+    max_frontier: int = 200_000,
+    max_steps: int = 1_000_000,
     ransac_n: int = 3,
     num_iterations: int = 1000,
     verbose: bool = True,
@@ -626,6 +661,10 @@ def expand_plane_from_seed(
         normal_threshold_deg: max angle between point normal and plane normal (if normals provided)
         expand_method: "component" or "bfs"
         max_refine_iters: number of plane refit iterations after expansion
+        adaptive_refine_threshold: If True, adjust distance_threshold per refine step using median/MAD
+        adaptive_refine_k: Robust scale multiplier for adaptive thresholding (median + k*sigma)
+        adaptive_refine_min_scale: Minimum adaptive threshold as scale of distance_threshold
+        adaptive_refine_max_scale: Maximum adaptive threshold as scale of distance_threshold
         ransac_n: RANSAC sample size for initial plane fit
         num_iterations: RANSAC iterations for initial plane fit
         verbose: print progress logs
@@ -635,6 +674,7 @@ def expand_plane_from_seed(
     """
     points = np.asarray(points, dtype=float)
     seed_center = np.asarray(seed_center, dtype=float).flatten()
+    time_start = perf_counter()
 
     if points.ndim != 2 or points.shape[1] != 3:
         return SeedExpandPlaneResult(
@@ -662,21 +702,26 @@ def expand_plane_from_seed(
         normals = normals / np.maximum(normals_norm, 1e-8)
     normal_cos_threshold = np.cos(np.deg2rad(normal_threshold_deg))
 
-    # Step 1: Extract seed points
-    distances_to_seed = np.linalg.norm(points - seed_center, axis=1)
-    seed_mask = distances_to_seed <= seed_radius
+    # Step 1: Extract seed points (squared distances for speed)
+    delta = points - seed_center
+    distances2_to_seed = np.einsum("ij,ij->i", delta, delta)
+    seed_radius2 = float(seed_radius) * float(seed_radius)
+    seed_mask = distances2_to_seed <= seed_radius2
     seed_indices = np.where(seed_mask)[0]
 
     if len(seed_indices) < 3:
         return SeedExpandPlaneResult(
             plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
-            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=None,
-            success=False, message=f"Too few seed points: {len(seed_indices)}"
+            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=seed_indices,
+            success=False, message=f"Too few seed points: {len(seed_indices)}",
+            seed_point_count=len(seed_indices),
         )
 
     seed_points = points[seed_indices]
+    time_seed = perf_counter()
     if verbose:
-        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m")
+        ms = (time_seed - time_start) * 1000.0
+        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m ({ms:.1f} ms)")
 
     # Step 2: Fit initial plane on seed points
     initial_plane = fit_plane(
@@ -690,19 +735,25 @@ def expand_plane_from_seed(
         return SeedExpandPlaneResult(
             plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
             area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=seed_indices,
-            success=False, message="Failed to fit initial plane on seed points"
+            success=False, message="Failed to fit initial plane on seed points",
+            seed_point_count=len(seed_indices),
         )
 
     plane_normal = initial_plane.normal
     plane_point = initial_plane.point
+    time_fit = perf_counter()
 
     if verbose:
-        print(f"  Initial plane: normal={np.round(plane_normal, 3).tolist()}, "
-              f"inliers={initial_plane.inlier_count}/{len(seed_points)}")
+        ms = (time_fit - time_seed) * 1000.0
+        print(
+            f"  Initial plane: normal={np.round(plane_normal, 3).tolist()}, "
+            f"inliers={initial_plane.inlier_count}/{len(seed_points)} ({ms:.1f} ms)"
+        )
 
     # Step 3: Expand from seed
-    # Limit expansion to max_expand_radius
-    expand_mask = distances_to_seed <= max_expand_radius
+    # Limit expansion to max_expand_radius (strictly subset before any neighbor search)
+    max_expand_radius2 = float(max_expand_radius) * float(max_expand_radius)
+    expand_mask = distances2_to_seed <= max_expand_radius2
     expand_indices = np.where(expand_mask)[0]
     expand_points = points[expand_indices]
 
@@ -721,9 +772,14 @@ def expand_plane_from_seed(
 
     candidate_local_indices = np.where(candidate_mask)[0]
     candidate_global_indices = expand_indices[candidate_local_indices]
+    time_candidates = perf_counter()
 
     if verbose:
-        print(f"  Plane candidates (distance < {distance_threshold}m): {len(candidate_local_indices)}")
+        ms = (time_candidates - time_fit) * 1000.0
+        print(
+            f"  Plane candidates (dist < {distance_threshold}m): {len(candidate_local_indices)} "
+            f"({ms:.1f} ms)"
+        )
 
     if len(candidate_local_indices) == 0:
         # Return seed plane only
@@ -733,7 +789,9 @@ def expand_plane_from_seed(
             expanded_inlier_count=initial_plane.inlier_count,
             area=0.0, extent_u=0.0, extent_v=0.0,
             seed_inlier_indices=seed_indices,
-            success=True, message="No expansion candidates found, returning seed plane"
+            success=True, message="No expansion candidates found, returning seed plane",
+            seed_point_count=len(seed_indices),
+            candidate_count=0,
         )
 
     # Map seed inliers to global indices
@@ -742,18 +800,27 @@ def expand_plane_from_seed(
     else:
         seed_inlier_global = seed_indices
 
-    # Expand using selected method
-    if expand_method == "bfs":
-        expanded_indices = _expand_bfs(
-            points, candidate_global_indices, seed_inlier_global, grow_radius
-        )
-    else:  # component
-        expanded_indices = _expand_component(
-            points, candidate_global_indices, seed_inlier_global, grow_radius
-        )
+    # Expand using selected method (both are connected-component extraction with different semantics)
+    expanded_indices, cc_stats = _extract_connected_component(
+        points,
+        candidate_global_indices,
+        seed_inlier_global,
+        grow_radius,
+        max_expanded_points=max_expanded_points,
+        max_frontier=max_frontier,
+        max_steps=max_steps,
+        enforce_seed_in_component=True,
+    )
+    time_expand = perf_counter()
 
     if verbose:
-        print(f"  Expanded region ({expand_method}): {len(expanded_indices)} points")
+        extra = f", stop={cc_stats.stop_reason}" if cc_stats.stopped_early else ""
+        ms = (time_expand - time_candidates) * 1000.0
+        print(
+            f"  Expanded region ({expand_method}): {len(expanded_indices)} points "
+            f"(seed_inliers={len(seed_inlier_global)}, frontier_max={cc_stats.max_frontier_size}, "
+            f"steps={cc_stats.steps}{extra}) ({ms:.1f} ms)"
+        )
 
     if len(expanded_indices) < 3:
         return SeedExpandPlaneResult(
@@ -762,29 +829,65 @@ def expand_plane_from_seed(
             expanded_inlier_count=len(seed_inlier_global),
             area=0.0, extent_u=0.0, extent_v=0.0,
             seed_inlier_indices=seed_indices,
-            success=True, message="Expansion resulted in too few points"
+            success=True, message="Expansion resulted in too few points",
+            seed_point_count=len(seed_indices),
+            candidate_count=len(candidate_local_indices),
+            stopped_early=cc_stats.stopped_early,
+            stop_reason=cc_stats.stop_reason,
+            steps=cc_stats.steps,
+            max_frontier_size=cc_stats.max_frontier_size,
         )
 
     # Step 4: Iterative refinement
     current_indices = expanded_indices
     final_plane = initial_plane
+    final_stats = cc_stats
 
     for refine_iter in range(max_refine_iters):
+        iter_start = perf_counter()
+        if len(current_indices) < 10:
+            if verbose:
+                print(f"    Refine iter {refine_iter + 1}: skipped (too few points: {len(current_indices)})")
+            break
         # Refit plane using expanded inliers
         expanded_points = points[current_indices]
         centroid = expanded_points.mean(axis=0)
         centered = expanded_points - centroid
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        _, s, vh = np.linalg.svd(centered, full_matrices=False)
+        if s.size < 2 or not np.all(np.isfinite(s)):
+            if verbose:
+                print(f"    Refine iter {refine_iter + 1}: skipped (degenerate SVD)")
+            break
+        if s[0] < 1e-12 or (s[1] / s[0]) < 1e-3:
+            if verbose:
+                print(f"    Refine iter {refine_iter + 1}: skipped (degenerate points)")
+            break
         new_normal = vh[-1]
-        new_normal = new_normal / np.linalg.norm(new_normal)
+        new_norm = np.linalg.norm(new_normal)
+        if not np.isfinite(new_norm) or new_norm < 1e-12:
+            if verbose:
+                print(f"    Refine iter {refine_iter + 1}: skipped (invalid normal)")
+            break
+        new_normal = new_normal / new_norm
+        new_normal = _orient_direction(new_normal, prefer_positive_z=True)
 
-        # Orient normal consistently
-        if np.dot(new_normal, plane_normal) < 0:
-            new_normal = -new_normal
+        refine_distance_threshold = float(distance_threshold)
+        if adaptive_refine_threshold:
+            residuals = np.abs((expanded_points - centroid) @ new_normal)
+            med = float(np.median(residuals))
+            mad = float(np.median(np.abs(residuals - med)))
+            sigma = 1.4826 * mad
+            estimate = med + float(adaptive_refine_k) * sigma
+            min_th = float(distance_threshold) * float(adaptive_refine_min_scale)
+            max_th = float(distance_threshold) * float(adaptive_refine_max_scale)
+            min_th = max(min_th, 1e-6)
+            max_th = max(max_th, min_th)
+            if np.isfinite(estimate):
+                refine_distance_threshold = float(np.clip(estimate, min_th, max_th))
 
         # Re-expand with new plane
         plane_distances = np.abs(np.dot(expand_points - centroid, new_normal))
-        candidate_mask = plane_distances < distance_threshold
+        candidate_mask = plane_distances < refine_distance_threshold
         if has_normals:
             expand_normals = normals[expand_indices]
             normal_alignment = np.abs(np.dot(expand_normals, new_normal))
@@ -793,17 +896,28 @@ def expand_plane_from_seed(
         candidate_local_indices = np.where(candidate_mask)[0]
         candidate_global_indices = expand_indices[candidate_local_indices]
 
-        if expand_method == "bfs":
-            new_indices = _expand_bfs(
-                points, candidate_global_indices, seed_inlier_global, grow_radius
-            )
-        else:
-            new_indices = _expand_component(
-                points, candidate_global_indices, seed_inlier_global, grow_radius
-            )
+        new_indices, refine_stats = _extract_connected_component(
+            points,
+            candidate_global_indices,
+            seed_inlier_global,
+            grow_radius,
+            max_expanded_points=max_expanded_points,
+            max_frontier=max_frontier,
+            max_steps=max_steps,
+            enforce_seed_in_component=True,
+        )
+        iter_end = perf_counter()
 
         if verbose:
-            print(f"    Refine iter {refine_iter + 1}: {len(new_indices)} points")
+            extra = f", stop={refine_stats.stop_reason}" if refine_stats.stopped_early else ""
+            th_info = (
+                f", th={refine_distance_threshold:.4f}m"
+                if adaptive_refine_threshold
+                else ""
+            )
+            ms = (iter_end - iter_start) * 1000.0
+            print(f"    Refine iter {refine_iter + 1}: {len(new_indices)} points{th_info}{extra} ({ms:.1f} ms)")
+        final_stats = refine_stats
 
         # Check convergence
         if len(new_indices) == len(current_indices) and np.array_equal(np.sort(new_indices), np.sort(current_indices)):
@@ -819,13 +933,34 @@ def expand_plane_from_seed(
         )
         plane_normal = new_normal
         plane_point = centroid
+        final_stats = refine_stats
 
     # Compute area and extent
     area, extent_u, extent_v = _compute_plane_metrics(points[current_indices], final_plane.normal)
+    residuals = np.abs((points[current_indices] - final_plane.point) @ final_plane.normal)
+    if residuals.size > 0:
+        residual_median, residual_p90, residual_p95 = np.percentile(residuals, [50, 90, 95]).astype(float)
+    else:
+        residual_median = residual_p90 = residual_p95 = 0.0
+    time_end = perf_counter()
 
     if verbose:
-        print(f"  Final: {len(current_indices)} inliers, area={area:.3f}m², "
-              f"extent=({extent_u:.2f} x {extent_v:.2f})m")
+        ms_total = (time_end - time_start) * 1000.0
+        print(
+            f"  Final: {len(current_indices)} inliers, area={area:.3f}m², "
+            f"extent=({extent_u:.2f} x {extent_v:.2f})m, "
+            f"residual_median/p95={residual_median:.4f}/{residual_p95:.4f}m "
+            f"({ms_total:.1f} ms)"
+        )
+        if final_stats.stopped_early:
+            print(f"  WARNING: expansion stopped early ({final_stats.stop_reason})")
+        if max_expanded_points > 0 and len(current_indices) >= max_expanded_points:
+            print(f"  WARNING: hit max_expanded_points={max_expanded_points}")
+        if max(extent_u, extent_v) > (2.0 * float(max_expand_radius) * 0.9):
+            print("  WARNING: extent is close to max_expand_radius; check for leakage")
+        area_max = np.pi * float(max_expand_radius) * float(max_expand_radius)
+        if area_max > 0 and area > (area_max * 0.9):
+            print("  WARNING: area is close to the max allowed by max_expand_radius; check for leakage")
 
     return SeedExpandPlaneResult(
         plane=PlaneParam(
@@ -842,115 +977,200 @@ def expand_plane_from_seed(
         extent_v=extent_v,
         seed_inlier_indices=seed_indices,
         success=True,
-        message="Plane expansion successful"
+        message=(
+            f"Plane expansion stopped early: {final_stats.stop_reason}"
+            if final_stats.stopped_early
+            else "Plane expansion successful"
+        ),
+        seed_point_count=len(seed_indices),
+        candidate_count=len(candidate_local_indices),
+        stopped_early=final_stats.stopped_early,
+        stop_reason=final_stats.stop_reason,
+        steps=final_stats.steps,
+        max_frontier_size=final_stats.max_frontier_size,
+        residual_median=float(residual_median),
+        residual_p90=float(residual_p90),
+        residual_p95=float(residual_p95),
     )
 
 
-def _expand_bfs(
+@dataclass
+class _ConnectedComponentStats:
+    stopped_early: bool
+    stop_reason: str
+    steps: int
+    max_frontier_size: int
+
+
+def _extract_connected_component(
     points: np.ndarray,
     candidate_indices: np.ndarray,
     seed_indices: np.ndarray,
-    grow_radius: float
-) -> np.ndarray:
-    """Expand using BFS from seed inliers."""
-    if len(candidate_indices) == 0:
-        return seed_indices.copy()
+    grow_radius: float,
+    *,
+    max_expanded_points: int,
+    max_frontier: int,
+    max_steps: int,
+    enforce_seed_in_component: bool,
+) -> tuple[np.ndarray, _ConnectedComponentStats]:
+    """Extract connected component from candidates using radius connectivity (spatial hashing)."""
+    candidate_indices = np.asarray(candidate_indices, dtype=int)
+    seed_indices = np.asarray(seed_indices, dtype=int)
+    if candidate_indices.size == 0 or seed_indices.size == 0:
+        return seed_indices.copy(), _ConnectedComponentStats(
+            stopped_early=False, stop_reason="", steps=0, max_frontier_size=0
+        )
 
-    # Build set for fast lookup
-    candidate_set = set(candidate_indices.tolist())
+    grow_radius = float(grow_radius)
+    if not np.isfinite(grow_radius) or grow_radius <= 0:
+        return seed_indices.copy(), _ConnectedComponentStats(
+            stopped_early=False, stop_reason="", steps=0, max_frontier_size=0
+        )
 
-    # Initialize with seed inliers that are also candidates
-    frontier = [i for i in seed_indices if i in candidate_set]
-    if len(frontier) == 0:
-        # Fall back to closest candidate to any seed point
-        seed_points = points[seed_indices]
-        candidate_points = points[candidate_indices]
-        min_dist = float('inf')
-        closest = candidate_indices[0] if len(candidate_indices) > 0 else None
-        for cp_idx, cp in zip(candidate_indices, candidate_points):
-            d = np.min(np.linalg.norm(seed_points - cp, axis=1))
-            if d < min_dist:
-                min_dist = d
-                closest = cp_idx
-        if closest is not None and min_dist <= grow_radius:
-            frontier = [closest]
-        else:
-            return seed_indices.copy()
+    # Sort for deterministic outputs and efficient seed->local mapping.
+    order = np.argsort(candidate_indices)
+    cand_global = candidate_indices[order]
+    cand_points = points[cand_global]
 
-    visited = set(frontier)
-    result = list(frontier)
+    seed_unique = np.unique(seed_indices)
+    pos = np.searchsorted(cand_global, seed_unique)
+    pos_ok = (pos < cand_global.size) & (cand_global[pos] == seed_unique)
+    seed_local = pos[pos_ok]
 
-    # BFS
-    while frontier:
-        current = frontier.pop(0)
-        current_point = points[current]
+    if seed_local.size == 0:
+        reason = "seed_not_in_candidates" if enforce_seed_in_component else ""
+        if enforce_seed_in_component:
+            return seed_indices.copy(), _ConnectedComponentStats(
+                stopped_early=False, stop_reason=reason, steps=0, max_frontier_size=0
+            )
+        # Fall back to empty component (caller can decide).
+        return np.empty((0,), dtype=int), _ConnectedComponentStats(
+            stopped_early=False, stop_reason=reason, steps=0, max_frontier_size=0
+        )
 
-        # Find neighbors
-        for idx in candidate_indices:
-            if idx in visited:
-                continue
-            if np.linalg.norm(points[idx] - current_point) <= grow_radius:
-                visited.add(idx)
-                result.append(idx)
-                frontier.append(idx)
+    max_expanded_points = int(max_expanded_points)
+    max_frontier = int(max_frontier)
+    max_steps = int(max_steps)
 
-    return np.array(result, dtype=int)
+    visited = np.zeros(cand_global.size, dtype=bool)
+    visited[seed_local] = True
+    visited_count = int(seed_local.size)
 
+    q: deque[int] = deque(int(i) for i in seed_local)
+    steps = 0
+    max_frontier_size = len(q)
+    stopped_early = False
+    stop_reason = ""
 
-def _expand_component(
-    points: np.ndarray,
-    candidate_indices: np.ndarray,
-    seed_indices: np.ndarray,
-    grow_radius: float
-) -> np.ndarray:
-    """Expand using connected component from seed."""
-    if len(candidate_indices) == 0:
-        return seed_indices.copy()
+    def should_stop_before_push() -> bool:
+        nonlocal stopped_early, stop_reason
+        if max_expanded_points > 0 and visited_count >= max_expanded_points:
+            stopped_early = True
+            stop_reason = "max_expanded_points"
+            return True
+        if max_frontier > 0 and len(q) >= max_frontier:
+            stopped_early = True
+            stop_reason = "max_frontier"
+            return True
+        return False
 
-    candidate_list = list(candidate_indices)
-    n_candidates = len(candidate_list)
-    idx_to_local = {idx: i for i, idx in enumerate(candidate_list)}
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+    except Exception:
+        cKDTree = None
 
-    # Build adjacency list using radius search
-    adjacency: List[List[int]] = [[] for _ in range(n_candidates)]
-    candidate_points = points[candidate_list]
+    if cKDTree is not None:
+        tree = cKDTree(cand_points)
 
-    # Simple O(n²) neighbor search for now (could use KD-tree for large datasets)
-    for i in range(n_candidates):
-        for j in range(i + 1, n_candidates):
-            if np.linalg.norm(candidate_points[i] - candidate_points[j]) <= grow_radius:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
+        while q:
+            if max_steps > 0 and steps >= max_steps:
+                stopped_early = True
+                stop_reason = "max_steps"
+                break
+            if max_expanded_points > 0 and visited_count >= max_expanded_points:
+                stopped_early = True
+                stop_reason = "max_expanded_points"
+                break
 
-    # Find component containing seed
-    seed_local = [idx_to_local[idx] for idx in seed_indices if idx in idx_to_local]
-    if len(seed_local) == 0:
-        # Find closest candidate to seed
-        seed_points = points[seed_indices]
-        min_dist = float('inf')
-        closest_local = None
-        for i, cp in enumerate(candidate_points):
-            d = np.min(np.linalg.norm(seed_points - cp, axis=1))
-            if d < min_dist:
-                min_dist = d
-                closest_local = i
-        if closest_local is not None and min_dist <= grow_radius:
-            seed_local = [closest_local]
-        else:
-            return seed_indices.copy()
+            max_frontier_size = max(max_frontier_size, len(q))
 
-    # BFS from seed to find connected component
-    visited = set(seed_local)
-    frontier = list(seed_local)
+            current = q.popleft()
+            steps += 1
 
-    while frontier:
-        current = frontier.pop(0)
-        for neighbor in adjacency[current]:
-            if neighbor not in visited:
-                visited.add(neighbor)
-                frontier.append(neighbor)
+            neighbors = tree.query_ball_point(cand_points[current], grow_radius, return_sorted=True)
+            for nbr in neighbors:
+                if visited[nbr]:
+                    continue
+                if should_stop_before_push():
+                    break
+                visited[nbr] = True
+                visited_count += 1
+                q.append(int(nbr))
+            if stopped_early:
+                break
+    else:
+        # Spatial hash grid fallback: cell size == grow_radius (27 neighboring cells cover all candidates).
+        cell_size = grow_radius
+        cell_coords = np.floor(cand_points / cell_size).astype(np.int64)
+        cell_to_indices: dict[tuple[int, int, int], list[int]] = {}
+        for i, (cx, cy, cz) in enumerate(cell_coords):
+            cell_to_indices.setdefault((int(cx), int(cy), int(cz)), []).append(i)
 
-    return np.array([candidate_list[i] for i in visited], dtype=int)
+        grow_radius2 = grow_radius * grow_radius
+
+        while q:
+            if max_steps > 0 and steps >= max_steps:
+                stopped_early = True
+                stop_reason = "max_steps"
+                break
+            if max_expanded_points > 0 and visited_count >= max_expanded_points:
+                stopped_early = True
+                stop_reason = "max_expanded_points"
+                break
+
+            max_frontier_size = max(max_frontier_size, len(q))
+
+            current = q.popleft()
+            steps += 1
+
+            cx, cy, cz = cell_coords[current]
+            base_point = cand_points[current]
+
+            stop_now = False
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        bucket = cell_to_indices.get((int(cx + dx), int(cy + dy), int(cz + dz)))
+                        if not bucket:
+                            continue
+                        for nbr in bucket:
+                            if visited[nbr]:
+                                continue
+                            diff = cand_points[nbr] - base_point
+                            if float(diff @ diff) <= grow_radius2:
+                                if should_stop_before_push():
+                                    stop_now = True
+                                    break
+                                visited[nbr] = True
+                                visited_count += 1
+                                q.append(nbr)
+                        if stop_now:
+                            break
+                    if stop_now:
+                        break
+                if stop_now:
+                    break
+            if stop_now:
+                break
+
+    component_local = np.flatnonzero(visited)
+    component_global = cand_global[component_local]
+    return component_global, _ConnectedComponentStats(
+        stopped_early=stopped_early,
+        stop_reason=stop_reason,
+        steps=steps,
+        max_frontier_size=max_frontier_size,
+    )
 
 
 def _compute_plane_metrics(inlier_points: np.ndarray, normal: np.ndarray) -> tuple:
@@ -1006,6 +1226,15 @@ class SeedExpandCylinderResult:
     seed_inlier_indices: Optional[np.ndarray]
     success: bool
     message: str
+    seed_point_count: int = 0
+    candidate_count: int = 0
+    stopped_early: bool = False
+    stop_reason: str = ""
+    steps: int = 0
+    max_frontier_size: int = 0
+    residual_median: float = 0.0
+    residual_p90: float = 0.0
+    residual_p95: float = 0.0
 
 
 def expand_cylinder_from_seed(
@@ -1019,6 +1248,10 @@ def expand_cylinder_from_seed(
     distance_threshold: float = 0.02,
     normal_threshold_deg: float = 30.0,
     expand_method: str = "component",
+    max_refine_iters: int = 3,
+    max_expanded_points: int = 200_000,
+    max_frontier: int = 200_000,
+    max_steps: int = 1_000_000,
     radius_min: float = 0.01,
     radius_max: float = 1.0,
     num_iterations: int = 1000,
@@ -1047,6 +1280,7 @@ def expand_cylinder_from_seed(
     """
     points = np.asarray(points, dtype=float)
     seed_center = np.asarray(seed_center, dtype=float).flatten()
+    time_start = perf_counter()
 
     if points.ndim != 2 or points.shape[1] != 3:
         return SeedExpandCylinderResult(
@@ -1072,23 +1306,28 @@ def expand_cylinder_from_seed(
         normals = normals / np.maximum(normals_norm, 1e-8)
     normal_cos_threshold = np.cos(np.deg2rad(normal_threshold_deg))
 
-    # Step 1: Extract seed points
-    distances_to_seed = np.linalg.norm(points - seed_center, axis=1)
-    seed_mask = distances_to_seed <= seed_radius
+    # Step 1: Extract seed points (squared distances for speed)
+    delta = points - seed_center
+    distances2_to_seed = np.einsum("ij,ij->i", delta, delta)
+    seed_radius2 = float(seed_radius) * float(seed_radius)
+    seed_mask = distances2_to_seed <= seed_radius2
     seed_indices = np.where(seed_mask)[0]
 
     if len(seed_indices) < 6:
         return SeedExpandCylinderResult(
             cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
-            seed_inlier_indices=None, success=False,
-            message=f"Too few seed points: {len(seed_indices)}"
+            seed_inlier_indices=seed_indices, success=False,
+            message=f"Too few seed points: {len(seed_indices)}",
+            seed_point_count=len(seed_indices),
         )
 
     seed_points = points[seed_indices]
     seed_normals = normals[seed_indices] if has_normals else None
+    time_seed = perf_counter()
 
     if verbose:
-        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m")
+        ms = (time_seed - time_start) * 1000.0
+        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m ({ms:.1f} ms)")
 
     # Step 2: Fit initial cylinder on seed points
     initial_cylinder = fit_cylinder(
@@ -1104,20 +1343,26 @@ def expand_cylinder_from_seed(
         return SeedExpandCylinderResult(
             cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
             seed_inlier_indices=seed_indices, success=False,
-            message="Failed to fit initial cylinder on seed points"
+            message="Failed to fit initial cylinder on seed points",
+            seed_point_count=len(seed_indices),
         )
 
     axis_point = initial_cylinder.axis_point
     axis_dir = initial_cylinder.axis_direction
     cyl_radius = initial_cylinder.radius
+    time_fit = perf_counter()
 
     if verbose:
-        print(f"  Initial cylinder: radius={cyl_radius:.4f}m, "
-              f"axis_dir={np.round(axis_dir, 3).tolist()}, "
-              f"inliers={initial_cylinder.inlier_count}/{len(seed_points)}")
+        ms = (time_fit - time_seed) * 1000.0
+        print(
+            f"  Initial cylinder: radius={cyl_radius:.4f}m, "
+            f"axis_dir={np.round(axis_dir, 3).tolist()}, "
+            f"inliers={initial_cylinder.inlier_count}/{len(seed_points)} ({ms:.1f} ms)"
+        )
 
-    # Step 3: Expand from seed
-    expand_mask = distances_to_seed <= max_expand_radius
+    # Step 3: Expand from seed (strictly limit by max_expand_radius before any neighbor search)
+    max_expand_radius2 = float(max_expand_radius) * float(max_expand_radius)
+    expand_mask = distances2_to_seed <= max_expand_radius2
     expand_indices = np.where(expand_mask)[0]
     expand_points = points[expand_indices]
 
@@ -1142,9 +1387,14 @@ def expand_cylinder_from_seed(
 
     candidate_local_indices = np.where(candidate_mask)[0]
     candidate_global_indices = expand_indices[candidate_local_indices]
+    time_candidates = perf_counter()
 
     if verbose:
-        print(f"  Cylinder candidates (surface dist < {distance_threshold}m): {len(candidate_local_indices)}")
+        ms = (time_candidates - time_fit) * 1000.0
+        print(
+            f"  Cylinder candidates (dist < {distance_threshold}m): {len(candidate_local_indices)} "
+            f"({ms:.1f} ms)"
+        )
 
     if len(candidate_local_indices) == 0:
         seed_inlier_global = seed_indices[initial_cylinder.inlier_indices] if initial_cylinder.inlier_indices is not None else seed_indices
@@ -1153,7 +1403,9 @@ def expand_cylinder_from_seed(
             expanded_inlier_indices=seed_inlier_global,
             expanded_inlier_count=len(seed_inlier_global),
             seed_inlier_indices=seed_indices,
-            success=True, message="No expansion candidates found, returning seed cylinder"
+            success=True, message="No expansion candidates found, returning seed cylinder",
+            seed_point_count=len(seed_indices),
+            candidate_count=0,
         )
 
     # Map seed inliers to global indices
@@ -1162,18 +1414,26 @@ def expand_cylinder_from_seed(
     else:
         seed_inlier_global = seed_indices
 
-    # Expand using selected method
-    if expand_method == "bfs":
-        expanded_indices = _expand_bfs(
-            points, candidate_global_indices, seed_inlier_global, grow_radius
-        )
-    else:
-        expanded_indices = _expand_component(
-            points, candidate_global_indices, seed_inlier_global, grow_radius
-        )
+    expanded_indices, cc_stats = _extract_connected_component(
+        points,
+        candidate_global_indices,
+        seed_inlier_global,
+        grow_radius,
+        max_expanded_points=max_expanded_points,
+        max_frontier=max_frontier,
+        max_steps=max_steps,
+        enforce_seed_in_component=True,
+    )
+    time_expand = perf_counter()
 
     if verbose:
-        print(f"  Expanded region ({expand_method}): {len(expanded_indices)} points")
+        extra = f", stop={cc_stats.stop_reason}" if cc_stats.stopped_early else ""
+        ms = (time_expand - time_candidates) * 1000.0
+        print(
+            f"  Expanded region ({expand_method}): {len(expanded_indices)} points "
+            f"(seed_inliers={len(seed_inlier_global)}, frontier_max={cc_stats.max_frontier_size}, "
+            f"steps={cc_stats.steps}{extra}) ({ms:.1f} ms)"
+        )
 
     if len(expanded_indices) < 6:
         return SeedExpandCylinderResult(
@@ -1181,48 +1441,155 @@ def expand_cylinder_from_seed(
             expanded_inlier_indices=seed_inlier_global,
             expanded_inlier_count=len(seed_inlier_global),
             seed_inlier_indices=seed_indices,
-            success=True, message="Expansion resulted in too few points"
+            success=True, message="Expansion resulted in too few points",
+            seed_point_count=len(seed_indices),
+            candidate_count=len(candidate_local_indices),
+            stopped_early=cc_stats.stopped_early,
+            stop_reason=cc_stats.stop_reason,
+            steps=cc_stats.steps,
+            max_frontier_size=cc_stats.max_frontier_size,
         )
 
-    # Recompute cylinder parameters from expanded inliers
-    expanded_points = points[expanded_indices]
-    centroid = expanded_points.mean(axis=0)
-    centered = expanded_points - centroid
-    _, _, vh = np.linalg.svd(centered)
-    new_axis_dir = vh[0]
-    new_axis_dir = new_axis_dir / np.linalg.norm(new_axis_dir)
+    # Recompute cylinder parameters from expanded inliers (1-2 refinement rounds)
+    refined_indices = expanded_indices
+    final_axis_point = axis_point
+    final_axis_dir = axis_dir
+    final_radius = float(cyl_radius)
+    final_length = float(initial_cylinder.length)
 
-    # Orient consistently
-    if np.dot(new_axis_dir, axis_dir) < 0:
-        new_axis_dir = -new_axis_dir
+    refine_rounds = max(1, min(int(max_refine_iters), 2))
+    for refine_iter in range(refine_rounds):
+        iter_start = perf_counter()
+        refined_points = points[refined_indices]
+        centroid = refined_points.mean(axis=0)
+        centered = refined_points - centroid
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        new_axis_dir = vh[0]
+        new_axis_dir = new_axis_dir / np.linalg.norm(new_axis_dir)
 
-    # Recompute radius and length
-    diff = expanded_points - centroid
-    projections = diff @ new_axis_dir
-    radial_vec = diff - np.outer(projections, new_axis_dir)
+        # Orient consistently to initial axis direction
+        if np.dot(new_axis_dir, axis_dir) < 0:
+            new_axis_dir = -new_axis_dir
+
+        diff = refined_points - centroid
+        projections = diff @ new_axis_dir
+        radial_vec = diff - np.outer(projections, new_axis_dir)
+        radial_dist = np.linalg.norm(radial_vec, axis=1)
+        new_radius = float(np.median(radial_dist))
+        new_length = float(np.max(projections) - np.min(projections))
+
+        # Re-inlier selection using updated cylinder on the full expansion region
+        diff_all = expand_points - centroid
+        projections_all = diff_all @ new_axis_dir
+        radial_vec_all = diff_all - np.outer(projections_all, new_axis_dir)
+        radial_dist_all = np.linalg.norm(radial_vec_all, axis=1)
+        cylinder_dist = np.abs(radial_dist_all - new_radius)
+        new_candidate_mask = cylinder_dist < distance_threshold
+        if has_normals:
+            expand_normals = normals[expand_indices]
+            radial_dir = radial_vec_all / np.maximum(radial_dist_all[:, None], 1e-8)
+            normal_alignment = np.abs(np.einsum("ij,ij->i", radial_dir, expand_normals))
+            new_candidate_mask &= normal_alignment > normal_cos_threshold
+
+        new_candidate_local = np.where(new_candidate_mask)[0]
+        new_candidate_global = expand_indices[new_candidate_local]
+        new_refined_indices, refine_stats = _extract_connected_component(
+            points,
+            new_candidate_global,
+            seed_inlier_global,
+            grow_radius,
+            max_expanded_points=max_expanded_points,
+            max_frontier=max_frontier,
+            max_steps=max_steps,
+            enforce_seed_in_component=True,
+        )
+        iter_end = perf_counter()
+
+        if verbose:
+            extra = f", stop={refine_stats.stop_reason}" if refine_stats.stopped_early else ""
+            ms = (iter_end - iter_start) * 1000.0
+            print(
+                f"    Refine iter {refine_iter + 1}: {len(new_refined_indices)} points, "
+                f"radius={new_radius:.4f}m, length={new_length:.3f}m{extra} ({ms:.1f} ms)"
+            )
+
+        # Convergence: stable membership.
+        if (
+            len(new_refined_indices) == len(refined_indices)
+            and np.array_equal(np.sort(new_refined_indices), np.sort(refined_indices))
+        ):
+            refined_indices = new_refined_indices
+            final_axis_point = centroid
+            final_axis_dir = new_axis_dir
+            final_radius = new_radius
+            final_length = new_length
+            cc_stats = refine_stats
+            break
+
+        refined_indices = new_refined_indices
+        final_axis_point = centroid
+        final_axis_dir = new_axis_dir
+        final_radius = new_radius
+        final_length = new_length
+        cc_stats = refine_stats
+
+    inlier_points = points[refined_indices]
+    diff = inlier_points - final_axis_point
+    proj = diff @ final_axis_dir
+    radial_vec = diff - np.outer(proj, final_axis_dir)
     radial_dist = np.linalg.norm(radial_vec, axis=1)
-    new_radius = float(np.median(radial_dist))
-    new_length = float(np.max(projections) - np.min(projections))
+    residuals = np.abs(radial_dist - final_radius)
+    if residuals.size > 0:
+        residual_median, residual_p90, residual_p95 = np.percentile(residuals, [50, 90, 95]).astype(float)
+    else:
+        residual_median = residual_p90 = residual_p95 = 0.0
+    time_end = perf_counter()
 
     if verbose:
-        print(f"  Final: {len(expanded_indices)} inliers, radius={new_radius:.4f}m, length={new_length:.3f}m")
+        ms_total = (time_end - time_start) * 1000.0
+        print(
+            f"  Final: {len(refined_indices)} inliers, radius={final_radius:.4f}m, "
+            f"length={final_length:.3f}m, residual_median/p95={residual_median:.4f}/{residual_p95:.4f}m "
+            f"({ms_total:.1f} ms)"
+        )
+        if cc_stats.stopped_early:
+            print(f"  WARNING: expansion stopped early ({cc_stats.stop_reason})")
+        if max_expanded_points > 0 and len(refined_indices) >= max_expanded_points:
+            print(f"  WARNING: hit max_expanded_points={max_expanded_points}")
+        if final_length > (float(max_expand_radius) * 1.8):
+            print("  WARNING: length is close to max_expand_radius; check for leakage")
+        if residual_p95 > (float(distance_threshold) * 1.2):
+            print("  WARNING: residual p95 is close to distance_threshold; consider tuning thresholds")
 
     final_cylinder = CylinderParam(
-        axis_point=centroid,
-        axis_direction=new_axis_dir,
-        radius=new_radius,
-        length=new_length,
-        inlier_count=len(expanded_indices),
-        inlier_indices=expanded_indices
+        axis_point=final_axis_point,
+        axis_direction=final_axis_dir,
+        radius=final_radius,
+        length=final_length,
+        inlier_count=len(refined_indices),
+        inlier_indices=refined_indices,
     )
 
     return SeedExpandCylinderResult(
         cylinder=final_cylinder,
-        expanded_inlier_indices=expanded_indices,
-        expanded_inlier_count=len(expanded_indices),
+        expanded_inlier_indices=refined_indices,
+        expanded_inlier_count=len(refined_indices),
         seed_inlier_indices=seed_indices,
         success=True,
-        message="Cylinder expansion successful"
+        message=(
+            f"Cylinder expansion stopped early: {cc_stats.stop_reason}"
+            if cc_stats.stopped_early
+            else "Cylinder expansion successful"
+        ),
+        seed_point_count=len(seed_indices),
+        candidate_count=len(candidate_local_indices),
+        stopped_early=cc_stats.stopped_early,
+        stop_reason=cc_stats.stop_reason,
+        steps=cc_stats.steps,
+        max_frontier_size=cc_stats.max_frontier_size,
+        residual_median=float(residual_median),
+        residual_p90=float(residual_p90),
+        residual_p95=float(residual_p95),
     )
 
 

@@ -60,6 +60,43 @@ def _make_cylinder_points(
     return points
 
 
+def _make_cylinder_grid_points(
+    *,
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    radius: float,
+    length: float,
+    n_theta: int,
+    n_t: int,
+    noise_std: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate a dense, well-connected set of points on a cylinder surface."""
+    axis_dir = axis_dir / np.linalg.norm(axis_dir)
+
+    if abs(axis_dir[2]) < 0.9:
+        u = np.cross(axis_dir, np.array([0.0, 0.0, 1.0]))
+    else:
+        u = np.cross(axis_dir, np.array([1.0, 0.0, 0.0]))
+    u = u / np.linalg.norm(u)
+    v = np.cross(axis_dir, u)
+
+    theta = np.linspace(0.0, 2 * np.pi, n_theta, endpoint=False)
+    t = np.linspace(-length / 2, length / 2, n_t)
+    theta_grid, t_grid = np.meshgrid(theta, t)
+    theta_flat = theta_grid.ravel()
+    t_flat = t_grid.ravel()
+    r = radius + rng.normal(scale=noise_std, size=len(theta_flat))
+
+    points = (
+        axis_point
+        + np.outer(t_flat, axis_dir)
+        + np.outer(r * np.cos(theta_flat), u)
+        + np.outer(r * np.sin(theta_flat), v)
+    )
+    return points
+
+
 def test_expand_plane_from_seed_connected_region():
     """Test that plane expansion only extracts connected region from seed."""
     rng = np.random.default_rng(42)
@@ -390,3 +427,123 @@ def test_expand_plane_area_computation():
     extents = sorted([result.extent_u, result.extent_v])
     assert 1.5 < extents[0] < 2.5, f"Smaller extent {extents[0]} not close to 2m"
     assert 2.5 < extents[1] < 3.5, f"Larger extent {extents[1]} not close to 3m"
+
+
+def test_expand_plane_respects_max_expand_radius():
+    """Points outside max_expand_radius must never be included, even if the plane continues."""
+    rng = np.random.default_rng(51)
+
+    # A long strip of planar points extending beyond max_expand_radius.
+    x = np.linspace(0.0, 3.0, 61)
+    y = np.linspace(-0.5, 0.5, 21)
+    xx, yy = np.meshgrid(x, y)
+    zz = rng.normal(scale=0.001, size=xx.size)
+    plane = np.column_stack([xx.ravel(), yy.ravel(), zz])
+
+    seed_center = np.array([0.0, 0.0, 0.0])
+    max_expand_radius = 1.0
+
+    result = expand_plane_from_seed(
+        plane,
+        seed_center,
+        seed_radius=0.3,
+        max_expand_radius=max_expand_radius,
+        grow_radius=0.15,
+        distance_threshold=0.01,
+        expand_method="component",
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.expanded_inlier_indices is not None
+    d = np.linalg.norm(plane[result.expanded_inlier_indices] - seed_center, axis=1)
+    assert d.max() <= max_expand_radius + 1e-6
+
+
+def test_expand_cylinder_nearby_cylinder_does_not_leak_when_disconnected():
+    """Nearby cylinder points can be candidates but must not leak across a connectivity gap."""
+    rng = np.random.default_rng(52)
+
+    radius = 0.1
+    length = 1.0
+    axis_dir = np.array([0.0, 0.0, 1.0])
+
+    cylinder_a = _make_cylinder_grid_points(
+        axis_point=np.array([0.0, 0.0, 0.0]),
+        axis_dir=axis_dir,
+        radius=radius,
+        length=length,
+        n_theta=60,
+        n_t=80,
+        noise_std=0.0005,
+        rng=rng,
+    )
+    # Slightly offset (gap ~2 cm): some points fall within cylinder_dist threshold, but gap > grow_radius.
+    cylinder_b = _make_cylinder_grid_points(
+        axis_point=np.array([0.22, 0.0, 0.0]),
+        axis_dir=axis_dir,
+        radius=radius,
+        length=length,
+        n_theta=60,
+        n_t=80,
+        noise_std=0.0005,
+        rng=rng,
+    )
+
+    points = np.vstack([cylinder_a, cylinder_b])
+    # Seed on the opposite side of cylinder A so the seed region does not include cylinder B.
+    seed_center = np.array([-radius, 0.0, 0.0])
+
+    result = expand_cylinder_from_seed(
+        points,
+        seed_center,
+        seed_radius=0.2,
+        max_expand_radius=2.0,
+        grow_radius=0.015,  # smaller than the gap
+        distance_threshold=0.03,  # allows some nearby-cylinder candidates
+        expand_method="component",
+        max_refine_iters=2,
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.expanded_inlier_indices is not None
+    expanded = set(result.expanded_inlier_indices.tolist())
+    a_idx = set(range(len(cylinder_a)))
+    b_idx = set(range(len(cylinder_a), len(points)))
+    overlap_a = len(expanded & a_idx)
+    overlap_b = len(expanded & b_idx)
+    assert overlap_a > 1000
+    assert overlap_b < 10
+
+
+def test_expand_plane_stops_at_max_expanded_points():
+    """max_expanded_points must cap the expansion and report the stop reason."""
+    rng = np.random.default_rng(53)
+    plane = _make_horizontal_plane_points(
+        z=0.0,
+        x_range=(-2.0, 2.0),
+        y_range=(-2.0, 2.0),
+        n=6000,
+        noise_std=0.001,
+        rng=rng,
+    )
+    seed_center = np.array([0.0, 0.0, 0.0])
+
+    result = expand_plane_from_seed(
+        plane,
+        seed_center,
+        seed_radius=0.5,
+        max_expand_radius=5.0,
+        grow_radius=0.2,
+        distance_threshold=0.02,
+        max_expanded_points=500,
+        max_frontier=1_000_000,
+        max_steps=1_000_000,
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.expanded_inlier_count <= 500
+    assert result.stopped_early
+    assert result.stop_reason == "max_expanded_points"
