@@ -8,12 +8,14 @@ CLI tool for fitting plane and cylinder primitives to point cloud data.
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import open3d as o3d
+
+from primitives import fit_plane, fit_cylinder, PlaneParam, CylinderParam, extract_stair_planes
 
 
 # =============================================================================
@@ -87,6 +89,16 @@ SENSOR_PROFILES: Dict[str, SensorProfile] = {
         plane_distance_threshold=0.03,
         cylinder_distance_threshold=0.04,
     ),
+    "mid70_stairs": SensorProfile(
+        name="Livox Mid-70 (Stairs Mode)",
+        voxel_size=0.03,
+        r_min=0.5,
+        r_max=3.0,
+        r_step=0.2,
+        min_points=200,
+        plane_distance_threshold=0.025,
+        cylinder_distance_threshold=0.03,
+    ),
 }
 
 # tkinter availability check (lazy import)
@@ -99,7 +111,6 @@ def _check_tkinter() -> bool:
     if _TKINTER_AVAILABLE is None:
         try:
             import tkinter as tk
-            from tkinter import filedialog
             # Test that we can actually create a root window
             root = tk.Tk()
             root.withdraw()
@@ -149,8 +160,6 @@ def select_file_with_dialog() -> Optional[str]:
     if filepath:
         return filepath
     return None
-
-from primitives import fit_plane, fit_cylinder, PlaneParam, CylinderParam
 
 
 # =============================================================================
@@ -410,8 +419,6 @@ class ROISelector:
         vis.run()
         vis.destroy_window()
 
-        cropped_indices = vis.get_cropped_geometry()
-
         # VisualizerWithEditing returns picked points, not cropped geometry
         # For actual crop, we'd need different approach
         # This is a simplified version using picked points
@@ -545,6 +552,330 @@ def visualize_cylinder_fit(
     o3d.visualization.draw_geometries(geometries, window_name="Cylinder Fit Result")
 
 
+def generate_plane_colors(n: int) -> List[np.ndarray]:
+    """Generate n distinct colors for plane visualization."""
+    colors = []
+    for i in range(n):
+        # Use HSV color space for distinct colors
+        hue = i / max(n, 1)
+        # Convert HSV to RGB (saturation=0.8, value=0.9)
+        h = hue * 6.0
+        c = 0.9 * 0.8
+        x = c * (1 - abs(h % 2 - 1))
+        m = 0.9 - c
+
+        if h < 1:
+            r, g, b = c, x, 0
+        elif h < 2:
+            r, g, b = x, c, 0
+        elif h < 3:
+            r, g, b = 0, c, x
+        elif h < 4:
+            r, g, b = 0, x, c
+        elif h < 5:
+            r, g, b = x, 0, c
+        else:
+            r, g, b = c, 0, x
+
+        colors.append(np.array([r + m, g + m, b + m]))
+
+    return colors
+
+
+def _plane_basis_from_normal(normal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    normal = np.asarray(normal, dtype=float)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm < 1e-12:
+        raise ValueError("Invalid plane normal")
+    normal = normal / normal_norm
+
+    if abs(normal[2]) < 0.9:
+        u = np.cross(normal, np.array([0.0, 0.0, 1.0]))
+    else:
+        u = np.cross(normal, np.array([1.0, 0.0, 0.0]))
+
+    u_norm = float(np.linalg.norm(u))
+    if not np.isfinite(u_norm) or u_norm < 1e-12:
+        raise ValueError("Failed to compute plane basis")
+    u = u / u_norm
+    v = np.cross(normal, u)
+    return u, v
+
+
+def _convex_hull_2d(points_2d: np.ndarray, *, round_decimals: int = 6) -> np.ndarray:
+    points_2d = np.asarray(points_2d, dtype=float)
+    if points_2d.ndim != 2 or points_2d.shape[1] != 2:
+        raise ValueError("points_2d must be (N, 2)")
+
+    points_2d = points_2d[np.all(np.isfinite(points_2d), axis=1)]
+    if len(points_2d) == 0:
+        return np.empty((0, 2), dtype=float)
+
+    pts = np.unique(np.round(points_2d, decimals=round_decimals), axis=0)
+    if len(pts) <= 2:
+        return pts
+
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower: List[np.ndarray] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[np.ndarray] = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.vstack((lower[:-1], upper[:-1]))
+    return hull
+
+
+def _polygon_area_2d(poly: np.ndarray) -> float:
+    poly = np.asarray(poly, dtype=float)
+    if poly.ndim != 2 or poly.shape[1] != 2 or len(poly) < 3:
+        return 0.0
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return 0.5 * float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def create_plane_patch_mesh(
+    plane: PlaneParam,
+    roi_points: np.ndarray,
+    color: np.ndarray,
+    *,
+    padding: float = 0.0,
+    use_convex_hull: bool = True,
+) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, float]]:
+    """
+    Create a plane patch mesh from inlier points.
+
+    - Inliers are projected onto the plane
+    - A 2D convex hull is computed in plane-local coordinates
+    - The hull is triangulated (fan triangulation)
+    - Vertex colors are assigned (PLY keeps them)
+    """
+    roi_points = np.asarray(roi_points, dtype=float)
+    if roi_points.ndim != 2 or roi_points.shape[1] != 3:
+        raise ValueError("roi_points must be (N, 3)")
+
+    if plane.inlier_indices is None or len(plane.inlier_indices) == 0:
+        raise ValueError("Plane has no inlier indices")
+
+    indices = np.asarray(plane.inlier_indices, dtype=int).reshape(-1)
+    indices = indices[(0 <= indices) & (indices < len(roi_points))]
+    inlier_points = roi_points[indices]
+    inlier_points = inlier_points[np.all(np.isfinite(inlier_points), axis=1)]
+    if len(inlier_points) < 3:
+        raise ValueError("Too few inlier points")
+
+    normal = np.asarray(plane.normal, dtype=float)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm < 1e-12:
+        raise ValueError("Invalid plane normal")
+    normal = normal / normal_norm
+
+    # Project inliers to the plane to remove normal-direction noise.
+    origin = np.asarray(plane.point, dtype=float)
+    rel = inlier_points - origin
+    distances = rel @ normal
+    projected = inlier_points - distances[:, None] * normal[None, :]
+    origin = projected.mean(axis=0)
+
+    u, v = _plane_basis_from_normal(normal)
+    local = projected - origin
+    coords = np.column_stack((local @ u, local @ v))
+
+    extent_u = float(coords[:, 0].max() - coords[:, 0].min())
+    extent_v = float(coords[:, 1].max() - coords[:, 1].min())
+
+    hull_2d: np.ndarray
+    if use_convex_hull:
+        hull_2d = _convex_hull_2d(coords)
+        if len(hull_2d) < 3:
+            use_convex_hull = False
+
+    if not use_convex_hull:
+        min_u, max_u = float(coords[:, 0].min()), float(coords[:, 0].max())
+        min_v, max_v = float(coords[:, 1].min()), float(coords[:, 1].max())
+        hull_2d = np.array(
+            [
+                [min_u, min_v],
+                [max_u, min_v],
+                [max_u, max_v],
+                [min_u, max_v],
+            ],
+            dtype=float,
+        )
+
+    if padding > 0:
+        centroid_2d = hull_2d.mean(axis=0)
+        vec = hull_2d - centroid_2d
+        norms = np.linalg.norm(vec, axis=1, keepdims=True)
+        hull_2d = centroid_2d + vec * ((norms + padding) / np.maximum(norms, 1e-9))
+
+    area = _polygon_area_2d(hull_2d)
+    vertices = origin + hull_2d[:, 0:1] * u[None, :] + hull_2d[:, 1:2] * v[None, :]
+
+    triangles = np.array([[0, i, i + 1] for i in range(1, len(vertices) - 1)], dtype=int)
+    if len(triangles) == 0:
+        raise ValueError("Failed to triangulate plane patch")
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.tile(color, (len(vertices), 1)))
+    mesh.compute_vertex_normals()
+
+    return mesh, {"extent_u": extent_u, "extent_v": extent_v, "area": float(area)}
+
+
+def _combine_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> o3d.geometry.TriangleMesh:
+    if len(meshes) == 0:
+        return o3d.geometry.TriangleMesh()
+
+    vertices_list: List[np.ndarray] = []
+    triangles_list: List[np.ndarray] = []
+    colors_list: List[np.ndarray] = []
+
+    vertex_offset = 0
+    for mesh in meshes:
+        v = np.asarray(mesh.vertices)
+        t = np.asarray(mesh.triangles)
+        c = np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None
+
+        vertices_list.append(v)
+        triangles_list.append(t + vertex_offset)
+        if c is None or len(c) != len(v):
+            colors_list.append(np.zeros((len(v), 3), dtype=float))
+        else:
+            colors_list.append(c)
+        vertex_offset += len(v)
+
+    combined = o3d.geometry.TriangleMesh()
+    combined.vertices = o3d.utility.Vector3dVector(np.vstack(vertices_list))
+    combined.triangles = o3d.utility.Vector3iVector(np.vstack(triangles_list))
+    combined.vertex_colors = o3d.utility.Vector3dVector(np.vstack(colors_list))
+    combined.compute_vertex_normals()
+    return combined
+
+
+def visualize_stair_planes(
+    roi_pcd: o3d.geometry.PointCloud,
+    planes: List[PlaneParam],
+    show_roi_points: bool = True
+):
+    """
+    Visualize multiple stair planes with the ROI point cloud.
+
+    Args:
+        roi_pcd: Point cloud of the ROI
+        planes: List of PlaneParam for detected planes
+        show_roi_points: If True, show ROI points in light gray
+    """
+    geometries = []
+    roi_points = np.asarray(roi_pcd.points)
+
+    # Add ROI point cloud in light gray
+    if show_roi_points:
+        roi_vis = o3d.geometry.PointCloud(roi_pcd)
+        roi_vis.paint_uniform_color([0.8, 0.8, 0.8])  # Light gray
+        geometries.append(roi_vis)
+
+    # Generate colors for planes
+    colors = generate_plane_colors(len(planes))
+
+    # Create mesh for each plane
+    for i, (plane, color) in enumerate(zip(planes, colors)):
+        try:
+            mesh, metrics = create_plane_patch_mesh(plane, roi_points, color, padding=0.02, use_convex_hull=True)
+            geometries.append(mesh)
+
+            height = float(plane.height) if plane.height is not None else float(np.asarray(plane.point)[2])
+            nz = float(np.clip(np.asarray(plane.normal, dtype=float)[2], -1.0, 1.0))
+            tilt_deg = float(np.rad2deg(np.arccos(abs(nz))))
+            small_patch = metrics["area"] < 0.01 or min(metrics["extent_u"], metrics["extent_v"]) < 0.10
+            print(
+                f"  [{i:02d}] height={height:+.3f}m tilt={tilt_deg:4.1f}deg "
+                f"inliers={plane.inlier_count:6d} extent=({metrics['extent_u']:.2f} x {metrics['extent_v']:.2f})m "
+                f"area={metrics['area']:.3f}m^2{'  <SMALL>' if small_patch else ''}"
+            )
+        except Exception as exc:
+            print(f"  [{i:02d}] Failed to create plane patch mesh: {type(exc).__name__}: {exc}")
+
+        # Also highlight inlier points with the same color
+        if plane.inlier_indices is not None and len(plane.inlier_indices) > 0:
+            inlier_pcd = o3d.geometry.PointCloud()
+            inlier_pcd.points = o3d.utility.Vector3dVector(roi_points[plane.inlier_indices])
+            inlier_pcd.paint_uniform_color(color * 0.8)  # Slightly darker
+            geometries.append(inlier_pcd)
+
+    print(f"\nVisualization: {len(planes)} plane patches")
+    print("  - Light gray: ROI points")
+    print("  - Colored patches: Detected stair planes")
+
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name=f"Stair Planes ({len(planes)} detected)"
+    )
+
+
+def export_stair_planes_mesh(
+    planes: List[PlaneParam],
+    roi_points: np.ndarray,
+    filepath: str,
+    padding: float = 0.0
+):
+    """
+    Export all stair plane meshes to a single PLY file.
+
+    Args:
+        planes: List of PlaneParam
+        roi_points: Points in the ROI
+        filepath: Output file path (PLY or OBJ)
+        padding: Padding around plane patches
+    """
+    if len(planes) == 0:
+        print("No planes to export")
+        return
+
+    colors = generate_plane_colors(len(planes))
+    meshes: List[o3d.geometry.TriangleMesh] = []
+
+    for i, (plane, color) in enumerate(zip(planes, colors)):
+        try:
+            mesh, metrics = create_plane_patch_mesh(plane, roi_points, color, padding=padding, use_convex_hull=True)
+            meshes.append(mesh)
+            height = float(plane.height) if plane.height is not None else float(np.asarray(plane.point)[2])
+            small_patch = metrics["area"] < 0.01 or min(metrics["extent_u"], metrics["extent_v"]) < 0.10
+            print(
+                f"  Export[{i:02d}] height={height:+.3f}m inliers={plane.inlier_count:6d} "
+                f"extent=({metrics['extent_u']:.2f} x {metrics['extent_v']:.2f})m "
+                f"area={metrics['area']:.3f}m^2{'  <SMALL>' if small_patch else ''}"
+            )
+        except Exception as exc:
+            print(f"  Export[{i:02d}] skipped: {type(exc).__name__}: {exc}")
+
+    if len(meshes) == 0:
+        print("No valid plane meshes to export")
+        return
+
+    combined_mesh = _combine_meshes(meshes)
+
+    # Export
+    success = o3d.io.write_triangle_mesh(filepath, combined_mesh)
+    if success:
+        print(f"Exported {len(meshes)} plane meshes to {filepath}")
+    else:
+        print(f"Failed to export mesh to {filepath}")
+
+
 # =============================================================================
 # Result I/O
 # =============================================================================
@@ -589,6 +920,38 @@ def append_cylinder_result(results: dict, cylinder: CylinderParam) -> dict:
         "inlier_count": cylinder.inlier_count
     })
     return results
+
+
+def save_stairs_results(
+    planes: List[PlaneParam],
+    filepath: str
+):
+    """
+    Save stair plane results to JSON file.
+
+    Args:
+        planes: List of PlaneParam detected as stair planes
+        filepath: Output JSON file path
+    """
+    result = {
+        "mode": "stairs",
+        "plane_count": len(planes),
+        "planes": []
+    }
+
+    for i, plane in enumerate(planes):
+        result["planes"].append({
+            "id": i,
+            "normal": plane.normal.tolist(),
+            "point": plane.point.tolist(),
+            "height": plane.height,
+            "inlier_count": plane.inlier_count
+        })
+
+    with open(filepath, 'w') as f:
+        json.dump(result, f, indent=2)
+
+    print(f"Stairs results saved to {filepath}")
 
 
 # =============================================================================
@@ -723,6 +1086,76 @@ def parse_args():
         action="store_true",
         dest="no_gui",
         help="Disable GUI file dialog (requires --input to be specified)"
+    )
+
+    # Stairs mode options
+    stairs_group = parser.add_argument_group("Stairs Mode Options")
+    stairs_group.add_argument(
+        "--stairs-mode",
+        action="store_true",
+        dest="stairs_mode",
+        help="Enable stairs mode: extract multiple horizontal planes from ROI"
+    )
+    stairs_group.add_argument(
+        "--max-planes",
+        type=int,
+        default=20,
+        help="Maximum number of planes to extract in stairs mode (default: 20)"
+    )
+    stairs_group.add_argument(
+        "--min-inliers",
+        type=int,
+        default=50,
+        help="Minimum inliers required for a plane in stairs mode (default: 50)"
+    )
+    stairs_group.add_argument(
+        "--stairs-ransac-n",
+        type=int,
+        default=3,
+        help="RANSAC n (sample size) for plane extraction in stairs mode (default: 3)"
+    )
+    stairs_group.add_argument(
+        "--stairs-num-iterations",
+        type=int,
+        default=1000,
+        help="RANSAC iterations per plane in stairs mode (default: 1000)"
+    )
+    stairs_group.add_argument(
+        "--max-tilt",
+        type=float,
+        default=15.0,
+        help="Maximum tilt angle (degrees) for horizontal plane filter (default: 15.0)"
+    )
+    stairs_group.add_argument(
+        "--height-eps",
+        type=float,
+        default=0.03,
+        help="Height tolerance (meters) for merging planes (default: 0.03)"
+    )
+    stairs_group.add_argument(
+        "--no-horizontal-filter",
+        action="store_true",
+        dest="no_horizontal_filter",
+        help="Disable horizontal plane filter (keep all planes)"
+    )
+    stairs_group.add_argument(
+        "--no-height-merge",
+        action="store_true",
+        dest="no_height_merge",
+        help="Disable height-based plane merging"
+    )
+    stairs_group.add_argument(
+        "--stairs-output",
+        type=str,
+        default="stairs_results.json",
+        help="Output JSON file for stairs mode (default: stairs_results.json)"
+    )
+    stairs_group.add_argument(
+        "--export-mesh",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export stair plane meshes to PLY/OBJ file (e.g., stairs_planes.ply)"
     )
 
     return parser.parse_args()
@@ -870,6 +1303,120 @@ def prompt_primitive_type() -> str:
         print("Invalid choice, please try again.")
 
 
+def run_stairs_mode(
+    pcd: o3d.geometry.PointCloud,
+    args,
+    profile: SensorProfile,
+    extra_config: dict
+):
+    """
+    Run stairs mode: extract multiple horizontal planes from ROI.
+
+    Args:
+        pcd: Preprocessed point cloud
+        args: Parsed command line arguments
+        profile: Effective sensor profile
+        extra_config: Additional configuration
+    """
+    print("\n" + "=" * 60)
+    print("  STAIRS MODE - Multi-plane Extraction")
+    print("=" * 60)
+    print("Parameters:")
+    print(f"  Max planes: {args.max_planes}")
+    print(f"  Min inliers: {args.min_inliers}")
+    print(f"  Plane threshold: {profile.plane_distance_threshold}m")
+    print(f"  RANSAC: n={args.stairs_ransac_n}, iters={args.stairs_num_iterations}")
+    print(f"  Max tilt: {args.max_tilt}°")
+    print(f"  Height epsilon: {args.height_eps}m")
+    print(f"  Horizontal filter: {'OFF' if args.no_horizontal_filter else 'ON'}")
+    print(f"  Height merge: {'OFF' if args.no_height_merge else 'ON'}")
+
+    roi_selector = ROISelector(pcd)
+
+    # Show point cloud first
+    print("\n=== Point Cloud Viewer ===")
+    print("Close the viewer window to proceed with ROI selection")
+    o3d.visualization.draw_geometries([pcd], window_name="Point Cloud (Stairs Mode)")
+
+    # Select ROI (adaptive or fixed)
+    if extra_config["no_adaptive_roi"]:
+        print(f"\nSelecting ROI (fixed radius: {profile.r_min}m)...")
+        roi_pcd = roi_selector.select_roi_picking(radius=profile.r_min)
+        if roi_pcd is None or roi_pcd.is_empty():
+            print("ROI selection cancelled or empty")
+            return
+    else:
+        roi_result = roi_selector.select_roi_adaptive(
+            r_min=profile.r_min,
+            r_max=profile.r_max,
+            r_step=profile.r_step,
+            min_points=profile.min_points
+        )
+
+        if roi_result.roi_pcd is None or roi_result.point_count == 0:
+            print(roi_result.message)
+            return
+
+        roi_pcd = roi_result.roi_pcd
+
+        if not roi_result.success:
+            print("\nWARNING: ROI has fewer points than required.")
+            proceed = input("Proceed with stair extraction anyway? [y/n]: ").strip().lower()
+            if proceed != 'y':
+                print("Stairs mode cancelled.")
+                return
+
+    # Get points from ROI
+    points = np.asarray(roi_pcd.points)
+    print(f"\nROI contains {len(points)} points")
+
+    # Extract stair planes
+    planes = extract_stair_planes(
+        points,
+        max_planes=args.max_planes,
+        min_inliers=args.min_inliers,
+        distance_threshold=profile.plane_distance_threshold,
+        ransac_n=args.stairs_ransac_n,
+        num_iterations=args.stairs_num_iterations,
+        max_tilt_deg=args.max_tilt,
+        height_eps=args.height_eps,
+        horizontal_only=not args.no_horizontal_filter,
+        merge_by_height=not args.no_height_merge
+    )
+
+    if len(planes) == 0:
+        print("\nNo stair planes detected!")
+        return
+
+    # Visualize results
+    visualize_stair_planes(roi_pcd, planes)
+
+    # Save results to JSON
+    save_stairs_results(planes, args.stairs_output)
+
+    # Export mesh if requested
+    if args.export_mesh:
+        export_stair_planes_mesh(planes, points, args.export_mesh)
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("  STAIRS MODE COMPLETE")
+    print("=" * 60)
+    print(f"Detected {len(planes)} stair planes:")
+    for i, p in enumerate(planes):
+        print(f"  [{i}] height={p.height:.3f}m, inliers={p.inlier_count}")
+
+    if len(planes) >= 2:
+        heights = [p.height for p in planes]
+        height_diffs = [heights[i+1] - heights[i] for i in range(len(heights)-1)]
+        avg_step = np.mean(height_diffs) if height_diffs else 0
+        print(f"\nAverage step height: {avg_step:.3f}m ({avg_step*100:.1f}cm)")
+
+    print(f"\nResults saved to: {args.stairs_output}")
+    if args.export_mesh:
+        print(f"Mesh exported to: {args.export_mesh}")
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -888,6 +1435,11 @@ def main():
     if not extra_config["no_preprocess"]:
         print("\nPreprocessing point cloud...")
         pcd = preprocess_point_cloud(pcd, voxel_size=profile.voxel_size)
+
+    # Check if stairs mode
+    if args.stairs_mode:
+        run_stairs_mode(pcd, args, profile, extra_config)
+        return
 
     # Load existing results
     results = load_results(args.output)
