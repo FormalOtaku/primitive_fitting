@@ -15,7 +15,11 @@ from typing import Optional, Dict, Tuple, List
 import numpy as np
 import open3d as o3d
 
-from primitives import fit_plane, fit_cylinder, PlaneParam, CylinderParam, extract_stair_planes
+from primitives import (
+    fit_plane, fit_cylinder, PlaneParam, CylinderParam, extract_stair_planes,
+    expand_plane_from_seed, expand_cylinder_from_seed,
+    SeedExpandPlaneResult, SeedExpandCylinderResult
+)
 
 
 # =============================================================================
@@ -1158,6 +1162,66 @@ def parse_args():
         help="Export stair plane meshes to PLY/OBJ file (e.g., stairs_planes.ply)"
     )
 
+    # Seed-expand mode options
+    seed_group = parser.add_argument_group("Seed-Expand Mode Options")
+    seed_group.add_argument(
+        "--seed-expand",
+        action="store_true",
+        dest="seed_expand",
+        help="Enable seed-expand mode: fit primitive on seed, then expand to connected region"
+    )
+    seed_group.add_argument(
+        "--seed-radius",
+        type=float,
+        default=0.3,
+        help="Radius for initial seed region (default: 0.3m)"
+    )
+    seed_group.add_argument(
+        "--max-expand-radius",
+        type=float,
+        default=5.0,
+        help="Maximum radius from seed center for expansion (default: 5.0m)"
+    )
+    seed_group.add_argument(
+        "--grow-radius",
+        type=float,
+        default=0.15,
+        help="Neighbor radius for connectivity/growth (default: 0.15m)"
+    )
+    seed_group.add_argument(
+        "--expand-method",
+        type=str,
+        default="component",
+        choices=["component", "bfs"],
+        help="Expansion method: 'component' (connected component) or 'bfs' (breadth-first search)"
+    )
+    seed_group.add_argument(
+        "--max-refine-iters",
+        type=int,
+        default=3,
+        help="Number of plane refit iterations after expansion (default: 3)"
+    )
+    seed_group.add_argument(
+        "--normal-th",
+        type=float,
+        default=30.0,
+        help="Normal angle threshold in degrees (default: 30.0, skipped if normals unavailable)"
+    )
+    seed_group.add_argument(
+        "--seed-output",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Output JSON file for seed-expand results (default: seed_expand_results.json)"
+    )
+    seed_group.add_argument(
+        "--export-inliers",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export expanded inlier points to PLY file (for debugging)"
+    )
+
     return parser.parse_args()
 
 
@@ -1303,6 +1367,343 @@ def prompt_primitive_type() -> str:
         print("Invalid choice, please try again.")
 
 
+def visualize_seed_expand_plane(
+    pcd: o3d.geometry.PointCloud,
+    result: SeedExpandPlaneResult,
+    seed_center: np.ndarray,
+    all_points: np.ndarray
+):
+    """Visualize seed-expand plane result."""
+    geometries = []
+
+    # Original point cloud in light gray
+    pcd_gray = o3d.geometry.PointCloud(pcd)
+    pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
+    geometries.append(pcd_gray)
+
+    # Seed region points (if available)
+    if result.seed_inlier_indices is not None and len(result.seed_inlier_indices) > 0:
+        seed_pcd = o3d.geometry.PointCloud()
+        seed_pcd.points = o3d.utility.Vector3dVector(all_points[result.seed_inlier_indices])
+        seed_pcd.paint_uniform_color([0.0, 0.5, 1.0])  # Blue for seed region
+        geometries.append(seed_pcd)
+
+    # Expanded inlier points in red
+    if result.expanded_inlier_indices is not None and len(result.expanded_inlier_indices) > 0:
+        inlier_pcd = o3d.geometry.PointCloud()
+        inlier_pcd.points = o3d.utility.Vector3dVector(all_points[result.expanded_inlier_indices])
+        inlier_pcd.paint_uniform_color([1.0, 0.0, 0.0])  # Red for expanded inliers
+        geometries.append(inlier_pcd)
+
+    # Plane patch mesh in green
+    if result.plane is not None and result.expanded_inlier_indices is not None:
+        try:
+            mesh, metrics = create_plane_patch_mesh(
+                result.plane,
+                all_points,
+                np.array([0.0, 0.8, 0.0]),  # Green
+                padding=0.02,
+                use_convex_hull=True
+            )
+            geometries.append(mesh)
+        except Exception as e:
+            print(f"  Warning: Could not create plane patch mesh: {e}")
+
+    # Seed center marker
+    seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    seed_marker.translate(seed_center)
+    seed_marker.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
+    seed_marker.compute_vertex_normals()
+    geometries.append(seed_marker)
+
+    print("\nVisualization:")
+    print("  - Gray: Original point cloud")
+    print("  - Blue: Seed region points")
+    print("  - Red: Expanded inlier points")
+    print("  - Green patch: Fitted plane")
+    print("  - Yellow sphere: Seed center")
+
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name=f"Seed-Expand Plane ({result.expanded_inlier_count} inliers)"
+    )
+
+
+def visualize_seed_expand_cylinder(
+    pcd: o3d.geometry.PointCloud,
+    result: SeedExpandCylinderResult,
+    seed_center: np.ndarray,
+    all_points: np.ndarray
+):
+    """Visualize seed-expand cylinder result."""
+    geometries = []
+
+    # Original point cloud in light gray
+    pcd_gray = o3d.geometry.PointCloud(pcd)
+    pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
+    geometries.append(pcd_gray)
+
+    # Seed region points
+    if result.seed_inlier_indices is not None and len(result.seed_inlier_indices) > 0:
+        seed_pcd = o3d.geometry.PointCloud()
+        seed_pcd.points = o3d.utility.Vector3dVector(all_points[result.seed_inlier_indices])
+        seed_pcd.paint_uniform_color([0.0, 0.5, 1.0])  # Blue for seed region
+        geometries.append(seed_pcd)
+
+    # Expanded inlier points in red
+    if result.expanded_inlier_indices is not None and len(result.expanded_inlier_indices) > 0:
+        inlier_pcd = o3d.geometry.PointCloud()
+        inlier_pcd.points = o3d.utility.Vector3dVector(all_points[result.expanded_inlier_indices])
+        inlier_pcd.paint_uniform_color([1.0, 0.0, 0.0])  # Red for expanded inliers
+        geometries.append(inlier_pcd)
+
+    # Cylinder mesh in blue
+    if result.cylinder is not None:
+        cyl = result.cylinder
+        cylinder_mesh = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=cyl.radius,
+            height=cyl.length,
+            resolution=20,
+            split=4
+        )
+
+        # Rotate to align with axis direction
+        z_axis = np.array([0, 0, 1])
+        rotation_axis = np.cross(z_axis, cyl.axis_direction)
+        if np.linalg.norm(rotation_axis) > 1e-6:
+            rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+            angle = np.arccos(np.clip(np.dot(z_axis, cyl.axis_direction), -1, 1))
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
+            cylinder_mesh.rotate(R, center=[0, 0, 0])
+
+        cylinder_mesh.translate(cyl.axis_point)
+        cylinder_mesh.paint_uniform_color([0.0, 0.0, 0.8])  # Blue
+        cylinder_mesh.compute_vertex_normals()
+        geometries.append(cylinder_mesh)
+
+        # Axis line in yellow
+        axis_start = cyl.axis_point - cyl.axis_direction * cyl.length / 2
+        axis_end = cyl.axis_point + cyl.axis_direction * cyl.length / 2
+        axis_line = o3d.geometry.LineSet()
+        axis_line.points = o3d.utility.Vector3dVector([axis_start, axis_end])
+        axis_line.lines = o3d.utility.Vector2iVector([[0, 1]])
+        axis_line.colors = o3d.utility.Vector3dVector([[1.0, 1.0, 0.0]])
+        geometries.append(axis_line)
+
+    # Seed center marker
+    seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    seed_marker.translate(seed_center)
+    seed_marker.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
+    seed_marker.compute_vertex_normals()
+    geometries.append(seed_marker)
+
+    print("\nVisualization:")
+    print("  - Gray: Original point cloud")
+    print("  - Blue points: Seed region")
+    print("  - Red points: Expanded inliers")
+    print("  - Blue cylinder: Fitted cylinder mesh")
+    print("  - Yellow line: Cylinder axis")
+
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name=f"Seed-Expand Cylinder ({result.expanded_inlier_count} inliers)"
+    )
+
+
+def save_seed_expand_result(
+    result,
+    primitive_type: str,
+    filepath: str,
+    seed_center: np.ndarray
+):
+    """Save seed-expand result to JSON."""
+    data = {
+        "mode": "seed_expand",
+        "primitive_type": primitive_type,
+        "seed_center": seed_center.tolist(),
+        "success": result.success,
+        "message": result.message,
+        "expanded_inlier_count": result.expanded_inlier_count,
+    }
+
+    if primitive_type == "plane" and result.plane is not None:
+        data["plane"] = {
+            "normal": result.plane.normal.tolist(),
+            "point": result.plane.point.tolist(),
+            "inlier_count": result.plane.inlier_count,
+        }
+        data["area"] = result.area
+        data["extent_u"] = result.extent_u
+        data["extent_v"] = result.extent_v
+    elif primitive_type == "cylinder" and result.cylinder is not None:
+        data["cylinder"] = {
+            "axis_point": result.cylinder.axis_point.tolist(),
+            "axis_direction": result.cylinder.axis_direction.tolist(),
+            "radius": result.cylinder.radius,
+            "length": result.cylinder.length,
+            "inlier_count": result.cylinder.inlier_count,
+        }
+
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Seed-expand results saved to {filepath}")
+
+
+def run_seed_expand_mode(
+    pcd: o3d.geometry.PointCloud,
+    args,
+    profile: SensorProfile,
+    extra_config: dict
+):
+    """
+    Run seed-expand mode: fit primitive on seed, then expand to connected region.
+    """
+    print("\n" + "=" * 60)
+    print("  SEED-EXPAND MODE")
+    print("=" * 60)
+    print("Parameters:")
+    print(f"  Seed radius: {args.seed_radius}m")
+    print(f"  Max expand radius: {args.max_expand_radius}m")
+    print(f"  Grow radius: {args.grow_radius}m")
+    print(f"  Expand method: {args.expand_method}")
+    print(f"  Max refine iterations: {args.max_refine_iters}")
+    print(f"  Normal threshold: {args.normal_th}°")
+    print(f"  Plane threshold: {profile.plane_distance_threshold}m")
+    print(f"  Cylinder threshold: {profile.cylinder_distance_threshold}m")
+
+    # Get all points and normals
+    all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+
+    # Show point cloud first
+    print("\n=== Point Cloud Viewer ===")
+    print("Close the viewer window to proceed with seed selection")
+    o3d.visualization.draw_geometries([pcd], window_name="Point Cloud (Seed-Expand Mode)")
+
+    # Select seed center using ROI selection
+    print("\n=== Seed Selection ===")
+    print("Shift + Left Click to pick the seed center point")
+    print("Press 'Q' to confirm selection")
+
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window("Select Seed Center Point")
+    vis.add_geometry(pcd)
+    vis.run()
+    vis.destroy_window()
+
+    picked_indices = vis.get_picked_points()
+
+    if len(picked_indices) == 0:
+        print("No point selected, cancelling seed-expand mode")
+        return
+
+    seed_idx = picked_indices[0]
+    seed_center = all_points[seed_idx]
+    print(f"Selected seed center: {np.round(seed_center, 4).tolist()}")
+
+    # Select primitive type
+    print("\nSelect primitive type:")
+    print("  [p] Plane")
+    print("  [c] Cylinder")
+    print("  [q] Cancel")
+    choice = input("Enter choice: ").strip().lower()
+
+    if choice == 'q':
+        print("Cancelled")
+        return
+
+    output_file = args.seed_output or "seed_expand_results.json"
+
+    if choice == 'p':
+        # Plane seed-expand
+        print("\n=== Plane Seed-Expand ===")
+        result = expand_plane_from_seed(
+            all_points,
+            seed_center,
+            normals=all_normals,
+            seed_radius=args.seed_radius,
+            max_expand_radius=args.max_expand_radius,
+            grow_radius=args.grow_radius,
+            distance_threshold=profile.plane_distance_threshold,
+            normal_threshold_deg=args.normal_th,
+            expand_method=args.expand_method,
+            max_refine_iters=args.max_refine_iters,
+            verbose=True
+        )
+
+        if result.success and result.plane is not None:
+            print("\n" + "-" * 40)
+            print("Plane Seed-Expand Result:")
+            print(f"  Normal: {np.round(result.plane.normal, 4).tolist()}")
+            print(f"  Point: {np.round(result.plane.point, 4).tolist()}")
+            print(f"  Expanded inliers: {result.expanded_inlier_count}")
+            print(f"  Area: {result.area:.3f} m²")
+            print(f"  Extent: ({result.extent_u:.2f} x {result.extent_v:.2f}) m")
+
+            # Visualize
+            visualize_seed_expand_plane(pcd, result, seed_center, all_points)
+
+            # Save results
+            save_seed_expand_result(result, "plane", output_file, seed_center)
+
+            # Export inliers if requested
+            if args.export_inliers and result.expanded_inlier_indices is not None:
+                inlier_pcd = o3d.geometry.PointCloud()
+                inlier_pcd.points = o3d.utility.Vector3dVector(all_points[result.expanded_inlier_indices])
+                o3d.io.write_point_cloud(args.export_inliers, inlier_pcd)
+                print(f"Exported inlier points to {args.export_inliers}")
+        else:
+            print(f"\nPlane seed-expand failed: {result.message}")
+
+    elif choice == 'c':
+        # Cylinder seed-expand
+        print("\n=== Cylinder Seed-Expand ===")
+        result = expand_cylinder_from_seed(
+            all_points,
+            seed_center,
+            normals=all_normals,
+            seed_radius=args.seed_radius,
+            max_expand_radius=args.max_expand_radius,
+            grow_radius=args.grow_radius,
+            distance_threshold=profile.cylinder_distance_threshold,
+            normal_threshold_deg=args.normal_th,
+            expand_method=args.expand_method,
+            verbose=True
+        )
+
+        if result.success and result.cylinder is not None:
+            print("\n" + "-" * 40)
+            print("Cylinder Seed-Expand Result:")
+            print(f"  Axis point: {np.round(result.cylinder.axis_point, 4).tolist()}")
+            print(f"  Axis direction: {np.round(result.cylinder.axis_direction, 4).tolist()}")
+            print(f"  Radius: {result.cylinder.radius:.4f} m")
+            print(f"  Length: {result.cylinder.length:.3f} m")
+            print(f"  Expanded inliers: {result.expanded_inlier_count}")
+
+            # Visualize
+            visualize_seed_expand_cylinder(pcd, result, seed_center, all_points)
+
+            # Save results
+            save_seed_expand_result(result, "cylinder", output_file, seed_center)
+
+            # Export inliers if requested
+            if args.export_inliers and result.expanded_inlier_indices is not None:
+                inlier_pcd = o3d.geometry.PointCloud()
+                inlier_pcd.points = o3d.utility.Vector3dVector(all_points[result.expanded_inlier_indices])
+                o3d.io.write_point_cloud(args.export_inliers, inlier_pcd)
+                print(f"Exported inlier points to {args.export_inliers}")
+        else:
+            print(f"\nCylinder seed-expand failed: {result.message}")
+
+    else:
+        print("Invalid choice")
+        return
+
+    print("\n" + "=" * 60)
+    print("  SEED-EXPAND MODE COMPLETE")
+    print("=" * 60)
+
+
 def run_stairs_mode(
     pcd: o3d.geometry.PointCloud,
     args,
@@ -1435,6 +1836,11 @@ def main():
     if not extra_config["no_preprocess"]:
         print("\nPreprocessing point cloud...")
         pcd = preprocess_point_cloud(pcd, voxel_size=profile.voxel_size)
+
+    # Check if seed-expand mode
+    if args.seed_expand:
+        run_seed_expand_mode(pcd, args, profile, extra_config)
+        return
 
     # Check if stairs mode
     if args.stairs_mode:

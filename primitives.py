@@ -570,6 +570,662 @@ def merge_planes_by_height(
     return merged_planes
 
 
+# =============================================================================
+# Seed-expand plane extraction
+# =============================================================================
+
+
+@dataclass
+class SeedExpandPlaneResult:
+    """Result of seed-expand plane extraction."""
+    plane: Optional[PlaneParam]
+    expanded_inlier_indices: Optional[np.ndarray]
+    expanded_inlier_count: int
+    area: float
+    extent_u: float
+    extent_v: float
+    seed_inlier_indices: Optional[np.ndarray]
+    success: bool
+    message: str
+
+
+def expand_plane_from_seed(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    normals: Optional[np.ndarray] = None,
+    *,
+    seed_radius: float = 0.3,
+    max_expand_radius: float = 5.0,
+    grow_radius: float = 0.15,
+    distance_threshold: float = 0.02,
+    normal_threshold_deg: float = 30.0,
+    expand_method: str = "component",
+    max_refine_iters: int = 3,
+    ransac_n: int = 3,
+    num_iterations: int = 1000,
+    verbose: bool = True,
+) -> SeedExpandPlaneResult:
+    """
+    Expand plane from seed point using region growing.
+
+    Algorithm:
+    1. Extract points within seed_radius from seed_center
+    2. Fit initial plane using RANSAC on seed points
+    3. Expand to find connected planar region using either:
+       - component: find all candidates, build neighbor graph, extract seed's connected component
+       - bfs: BFS from seed inliers, adding neighbors that satisfy plane/normal conditions
+
+    Args:
+        points: (N, 3) array of 3D points
+        seed_center: (3,) seed center point
+        normals: (N, 3) array of point normals (optional)
+        seed_radius: radius for initial seed region
+        max_expand_radius: maximum radius from seed center for expansion
+        grow_radius: neighbor radius for connectivity (component) or BFS growth
+        distance_threshold: max distance from plane to be considered inlier
+        normal_threshold_deg: max angle between point normal and plane normal (if normals provided)
+        expand_method: "component" or "bfs"
+        max_refine_iters: number of plane refit iterations after expansion
+        ransac_n: RANSAC sample size for initial plane fit
+        num_iterations: RANSAC iterations for initial plane fit
+        verbose: print progress logs
+
+    Returns:
+        SeedExpandPlaneResult with expanded plane and metadata
+    """
+    points = np.asarray(points, dtype=float)
+    seed_center = np.asarray(seed_center, dtype=float).flatten()
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        return SeedExpandPlaneResult(
+            plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=None,
+            success=False, message="Invalid points shape"
+        )
+
+    if len(seed_center) != 3:
+        return SeedExpandPlaneResult(
+            plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=None,
+            success=False, message="Invalid seed_center shape"
+        )
+
+    # Check normals
+    has_normals = (
+        normals is not None and
+        len(normals) == len(points) and
+        np.all(np.isfinite(normals))
+    )
+    if has_normals:
+        normals = np.asarray(normals, dtype=float)
+        normals_norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.maximum(normals_norm, 1e-8)
+    normal_cos_threshold = np.cos(np.deg2rad(normal_threshold_deg))
+
+    # Step 1: Extract seed points
+    distances_to_seed = np.linalg.norm(points - seed_center, axis=1)
+    seed_mask = distances_to_seed <= seed_radius
+    seed_indices = np.where(seed_mask)[0]
+
+    if len(seed_indices) < 3:
+        return SeedExpandPlaneResult(
+            plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=None,
+            success=False, message=f"Too few seed points: {len(seed_indices)}"
+        )
+
+    seed_points = points[seed_indices]
+    if verbose:
+        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m")
+
+    # Step 2: Fit initial plane on seed points
+    initial_plane = fit_plane(
+        seed_points,
+        distance_threshold=distance_threshold,
+        ransac_n=ransac_n,
+        num_iterations=num_iterations
+    )
+
+    if initial_plane is None:
+        return SeedExpandPlaneResult(
+            plane=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            area=0.0, extent_u=0.0, extent_v=0.0, seed_inlier_indices=seed_indices,
+            success=False, message="Failed to fit initial plane on seed points"
+        )
+
+    plane_normal = initial_plane.normal
+    plane_point = initial_plane.point
+
+    if verbose:
+        print(f"  Initial plane: normal={np.round(plane_normal, 3).tolist()}, "
+              f"inliers={initial_plane.inlier_count}/{len(seed_points)}")
+
+    # Step 3: Expand from seed
+    # Limit expansion to max_expand_radius
+    expand_mask = distances_to_seed <= max_expand_radius
+    expand_indices = np.where(expand_mask)[0]
+    expand_points = points[expand_indices]
+
+    if verbose:
+        print(f"  Expansion region: {len(expand_points)} points within {max_expand_radius}m")
+
+    # Compute plane distance for all expansion candidates
+    plane_distances = np.abs(np.dot(expand_points - plane_point, plane_normal))
+    candidate_mask = plane_distances < distance_threshold
+
+    # Optional: apply normal condition
+    if has_normals:
+        expand_normals = normals[expand_indices]
+        normal_alignment = np.abs(np.dot(expand_normals, plane_normal))
+        candidate_mask &= normal_alignment > normal_cos_threshold
+
+    candidate_local_indices = np.where(candidate_mask)[0]
+    candidate_global_indices = expand_indices[candidate_local_indices]
+
+    if verbose:
+        print(f"  Plane candidates (distance < {distance_threshold}m): {len(candidate_local_indices)}")
+
+    if len(candidate_local_indices) == 0:
+        # Return seed plane only
+        return SeedExpandPlaneResult(
+            plane=initial_plane,
+            expanded_inlier_indices=seed_indices[initial_plane.inlier_indices] if initial_plane.inlier_indices is not None else seed_indices,
+            expanded_inlier_count=initial_plane.inlier_count,
+            area=0.0, extent_u=0.0, extent_v=0.0,
+            seed_inlier_indices=seed_indices,
+            success=True, message="No expansion candidates found, returning seed plane"
+        )
+
+    # Map seed inliers to global indices
+    if initial_plane.inlier_indices is not None:
+        seed_inlier_global = seed_indices[initial_plane.inlier_indices]
+    else:
+        seed_inlier_global = seed_indices
+
+    # Expand using selected method
+    if expand_method == "bfs":
+        expanded_indices = _expand_bfs(
+            points, candidate_global_indices, seed_inlier_global, grow_radius
+        )
+    else:  # component
+        expanded_indices = _expand_component(
+            points, candidate_global_indices, seed_inlier_global, grow_radius
+        )
+
+    if verbose:
+        print(f"  Expanded region ({expand_method}): {len(expanded_indices)} points")
+
+    if len(expanded_indices) < 3:
+        return SeedExpandPlaneResult(
+            plane=initial_plane,
+            expanded_inlier_indices=seed_inlier_global,
+            expanded_inlier_count=len(seed_inlier_global),
+            area=0.0, extent_u=0.0, extent_v=0.0,
+            seed_inlier_indices=seed_indices,
+            success=True, message="Expansion resulted in too few points"
+        )
+
+    # Step 4: Iterative refinement
+    current_indices = expanded_indices
+    final_plane = initial_plane
+
+    for refine_iter in range(max_refine_iters):
+        # Refit plane using expanded inliers
+        expanded_points = points[current_indices]
+        centroid = expanded_points.mean(axis=0)
+        centered = expanded_points - centroid
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        new_normal = vh[-1]
+        new_normal = new_normal / np.linalg.norm(new_normal)
+
+        # Orient normal consistently
+        if np.dot(new_normal, plane_normal) < 0:
+            new_normal = -new_normal
+
+        # Re-expand with new plane
+        plane_distances = np.abs(np.dot(expand_points - centroid, new_normal))
+        candidate_mask = plane_distances < distance_threshold
+        if has_normals:
+            expand_normals = normals[expand_indices]
+            normal_alignment = np.abs(np.dot(expand_normals, new_normal))
+            candidate_mask &= normal_alignment > normal_cos_threshold
+
+        candidate_local_indices = np.where(candidate_mask)[0]
+        candidate_global_indices = expand_indices[candidate_local_indices]
+
+        if expand_method == "bfs":
+            new_indices = _expand_bfs(
+                points, candidate_global_indices, seed_inlier_global, grow_radius
+            )
+        else:
+            new_indices = _expand_component(
+                points, candidate_global_indices, seed_inlier_global, grow_radius
+            )
+
+        if verbose:
+            print(f"    Refine iter {refine_iter + 1}: {len(new_indices)} points")
+
+        # Check convergence
+        if len(new_indices) == len(current_indices) and np.array_equal(np.sort(new_indices), np.sort(current_indices)):
+            break
+
+        current_indices = new_indices
+        final_plane = PlaneParam(
+            normal=new_normal,
+            point=centroid,
+            inlier_count=len(current_indices),
+            inlier_indices=current_indices,
+            height=float(centroid[2])
+        )
+        plane_normal = new_normal
+        plane_point = centroid
+
+    # Compute area and extent
+    area, extent_u, extent_v = _compute_plane_metrics(points[current_indices], final_plane.normal)
+
+    if verbose:
+        print(f"  Final: {len(current_indices)} inliers, area={area:.3f}m², "
+              f"extent=({extent_u:.2f} x {extent_v:.2f})m")
+
+    return SeedExpandPlaneResult(
+        plane=PlaneParam(
+            normal=final_plane.normal,
+            point=final_plane.point,
+            inlier_count=len(current_indices),
+            inlier_indices=current_indices,
+            height=float(final_plane.point[2])
+        ),
+        expanded_inlier_indices=current_indices,
+        expanded_inlier_count=len(current_indices),
+        area=area,
+        extent_u=extent_u,
+        extent_v=extent_v,
+        seed_inlier_indices=seed_indices,
+        success=True,
+        message="Plane expansion successful"
+    )
+
+
+def _expand_bfs(
+    points: np.ndarray,
+    candidate_indices: np.ndarray,
+    seed_indices: np.ndarray,
+    grow_radius: float
+) -> np.ndarray:
+    """Expand using BFS from seed inliers."""
+    if len(candidate_indices) == 0:
+        return seed_indices.copy()
+
+    # Build set for fast lookup
+    candidate_set = set(candidate_indices.tolist())
+
+    # Initialize with seed inliers that are also candidates
+    frontier = [i for i in seed_indices if i in candidate_set]
+    if len(frontier) == 0:
+        # Fall back to closest candidate to any seed point
+        seed_points = points[seed_indices]
+        candidate_points = points[candidate_indices]
+        min_dist = float('inf')
+        closest = candidate_indices[0] if len(candidate_indices) > 0 else None
+        for cp_idx, cp in zip(candidate_indices, candidate_points):
+            d = np.min(np.linalg.norm(seed_points - cp, axis=1))
+            if d < min_dist:
+                min_dist = d
+                closest = cp_idx
+        if closest is not None and min_dist <= grow_radius:
+            frontier = [closest]
+        else:
+            return seed_indices.copy()
+
+    visited = set(frontier)
+    result = list(frontier)
+
+    # BFS
+    while frontier:
+        current = frontier.pop(0)
+        current_point = points[current]
+
+        # Find neighbors
+        for idx in candidate_indices:
+            if idx in visited:
+                continue
+            if np.linalg.norm(points[idx] - current_point) <= grow_radius:
+                visited.add(idx)
+                result.append(idx)
+                frontier.append(idx)
+
+    return np.array(result, dtype=int)
+
+
+def _expand_component(
+    points: np.ndarray,
+    candidate_indices: np.ndarray,
+    seed_indices: np.ndarray,
+    grow_radius: float
+) -> np.ndarray:
+    """Expand using connected component from seed."""
+    if len(candidate_indices) == 0:
+        return seed_indices.copy()
+
+    candidate_list = list(candidate_indices)
+    n_candidates = len(candidate_list)
+    idx_to_local = {idx: i for i, idx in enumerate(candidate_list)}
+
+    # Build adjacency list using radius search
+    adjacency: List[List[int]] = [[] for _ in range(n_candidates)]
+    candidate_points = points[candidate_list]
+
+    # Simple O(n²) neighbor search for now (could use KD-tree for large datasets)
+    for i in range(n_candidates):
+        for j in range(i + 1, n_candidates):
+            if np.linalg.norm(candidate_points[i] - candidate_points[j]) <= grow_radius:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+
+    # Find component containing seed
+    seed_local = [idx_to_local[idx] for idx in seed_indices if idx in idx_to_local]
+    if len(seed_local) == 0:
+        # Find closest candidate to seed
+        seed_points = points[seed_indices]
+        min_dist = float('inf')
+        closest_local = None
+        for i, cp in enumerate(candidate_points):
+            d = np.min(np.linalg.norm(seed_points - cp, axis=1))
+            if d < min_dist:
+                min_dist = d
+                closest_local = i
+        if closest_local is not None and min_dist <= grow_radius:
+            seed_local = [closest_local]
+        else:
+            return seed_indices.copy()
+
+    # BFS from seed to find connected component
+    visited = set(seed_local)
+    frontier = list(seed_local)
+
+    while frontier:
+        current = frontier.pop(0)
+        for neighbor in adjacency[current]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                frontier.append(neighbor)
+
+    return np.array([candidate_list[i] for i in visited], dtype=int)
+
+
+def _compute_plane_metrics(inlier_points: np.ndarray, normal: np.ndarray) -> tuple:
+    """Compute area and extent of plane inliers."""
+    if len(inlier_points) < 3:
+        return 0.0, 0.0, 0.0
+
+    normal = np.asarray(normal, dtype=float)
+    normal = normal / np.linalg.norm(normal)
+
+    # Compute plane basis
+    if abs(normal[2]) < 0.9:
+        u = np.cross(normal, np.array([0.0, 0.0, 1.0]))
+    else:
+        u = np.cross(normal, np.array([1.0, 0.0, 0.0]))
+    u = u / np.linalg.norm(u)
+    v = np.cross(normal, u)
+
+    # Project to 2D
+    centroid = inlier_points.mean(axis=0)
+    local = inlier_points - centroid
+    coords_2d = np.column_stack((local @ u, local @ v))
+
+    extent_u = float(coords_2d[:, 0].max() - coords_2d[:, 0].min())
+    extent_v = float(coords_2d[:, 1].max() - coords_2d[:, 1].min())
+
+    # Compute convex hull area
+    try:
+        from scipy.spatial import ConvexHull
+        if len(coords_2d) >= 3:
+            hull = ConvexHull(coords_2d)
+            area = float(hull.volume)  # In 2D, volume is area
+        else:
+            area = 0.0
+    except Exception:
+        # Fallback: bounding box area
+        area = extent_u * extent_v
+
+    return area, extent_u, extent_v
+
+
+# =============================================================================
+# Seed-expand cylinder extraction
+# =============================================================================
+
+
+@dataclass
+class SeedExpandCylinderResult:
+    """Result of seed-expand cylinder extraction."""
+    cylinder: Optional[CylinderParam]
+    expanded_inlier_indices: Optional[np.ndarray]
+    expanded_inlier_count: int
+    seed_inlier_indices: Optional[np.ndarray]
+    success: bool
+    message: str
+
+
+def expand_cylinder_from_seed(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    normals: Optional[np.ndarray] = None,
+    *,
+    seed_radius: float = 0.3,
+    max_expand_radius: float = 5.0,
+    grow_radius: float = 0.15,
+    distance_threshold: float = 0.02,
+    normal_threshold_deg: float = 30.0,
+    expand_method: str = "component",
+    radius_min: float = 0.01,
+    radius_max: float = 1.0,
+    num_iterations: int = 1000,
+    verbose: bool = True,
+) -> SeedExpandCylinderResult:
+    """
+    Expand cylinder from seed point using region growing.
+
+    Args:
+        points: (N, 3) array of 3D points
+        seed_center: (3,) seed center point
+        normals: (N, 3) array of point normals (optional)
+        seed_radius: radius for initial seed region
+        max_expand_radius: maximum radius from seed center for expansion
+        grow_radius: neighbor radius for connectivity
+        distance_threshold: max distance from cylinder surface for inliers
+        normal_threshold_deg: max angle between point normal and radial direction
+        expand_method: "component" or "bfs"
+        radius_min: minimum cylinder radius
+        radius_max: maximum cylinder radius
+        num_iterations: RANSAC iterations for initial fit
+        verbose: print progress logs
+
+    Returns:
+        SeedExpandCylinderResult with expanded cylinder and metadata
+    """
+    points = np.asarray(points, dtype=float)
+    seed_center = np.asarray(seed_center, dtype=float).flatten()
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        return SeedExpandCylinderResult(
+            cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            seed_inlier_indices=None, success=False, message="Invalid points shape"
+        )
+
+    if len(seed_center) != 3:
+        return SeedExpandCylinderResult(
+            cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            seed_inlier_indices=None, success=False, message="Invalid seed_center shape"
+        )
+
+    # Check normals
+    has_normals = (
+        normals is not None and
+        len(normals) == len(points) and
+        np.all(np.isfinite(normals))
+    )
+    if has_normals:
+        normals = np.asarray(normals, dtype=float)
+        normals_norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.maximum(normals_norm, 1e-8)
+    normal_cos_threshold = np.cos(np.deg2rad(normal_threshold_deg))
+
+    # Step 1: Extract seed points
+    distances_to_seed = np.linalg.norm(points - seed_center, axis=1)
+    seed_mask = distances_to_seed <= seed_radius
+    seed_indices = np.where(seed_mask)[0]
+
+    if len(seed_indices) < 6:
+        return SeedExpandCylinderResult(
+            cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            seed_inlier_indices=None, success=False,
+            message=f"Too few seed points: {len(seed_indices)}"
+        )
+
+    seed_points = points[seed_indices]
+    seed_normals = normals[seed_indices] if has_normals else None
+
+    if verbose:
+        print(f"  Seed region: {len(seed_points)} points within {seed_radius}m")
+
+    # Step 2: Fit initial cylinder on seed points
+    initial_cylinder = fit_cylinder(
+        seed_points,
+        seed_normals,
+        distance_threshold=distance_threshold,
+        radius_min=radius_min,
+        radius_max=radius_max,
+        num_iterations=num_iterations
+    )
+
+    if initial_cylinder is None:
+        return SeedExpandCylinderResult(
+            cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+            seed_inlier_indices=seed_indices, success=False,
+            message="Failed to fit initial cylinder on seed points"
+        )
+
+    axis_point = initial_cylinder.axis_point
+    axis_dir = initial_cylinder.axis_direction
+    cyl_radius = initial_cylinder.radius
+
+    if verbose:
+        print(f"  Initial cylinder: radius={cyl_radius:.4f}m, "
+              f"axis_dir={np.round(axis_dir, 3).tolist()}, "
+              f"inliers={initial_cylinder.inlier_count}/{len(seed_points)}")
+
+    # Step 3: Expand from seed
+    expand_mask = distances_to_seed <= max_expand_radius
+    expand_indices = np.where(expand_mask)[0]
+    expand_points = points[expand_indices]
+
+    if verbose:
+        print(f"  Expansion region: {len(expand_points)} points within {max_expand_radius}m")
+
+    # Compute cylinder distance for all expansion candidates
+    diff = expand_points - axis_point
+    projections = diff @ axis_dir
+    radial_vec = diff - np.outer(projections, axis_dir)
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+    cylinder_dist = np.abs(radial_dist - cyl_radius)
+
+    candidate_mask = cylinder_dist < distance_threshold
+
+    # Optional: apply normal condition
+    if has_normals:
+        expand_normals = normals[expand_indices]
+        radial_dir = radial_vec / np.maximum(radial_dist[:, None], 1e-8)
+        normal_alignment = np.abs(np.einsum('ij,ij->i', radial_dir, expand_normals))
+        candidate_mask &= normal_alignment > normal_cos_threshold
+
+    candidate_local_indices = np.where(candidate_mask)[0]
+    candidate_global_indices = expand_indices[candidate_local_indices]
+
+    if verbose:
+        print(f"  Cylinder candidates (surface dist < {distance_threshold}m): {len(candidate_local_indices)}")
+
+    if len(candidate_local_indices) == 0:
+        seed_inlier_global = seed_indices[initial_cylinder.inlier_indices] if initial_cylinder.inlier_indices is not None else seed_indices
+        return SeedExpandCylinderResult(
+            cylinder=initial_cylinder,
+            expanded_inlier_indices=seed_inlier_global,
+            expanded_inlier_count=len(seed_inlier_global),
+            seed_inlier_indices=seed_indices,
+            success=True, message="No expansion candidates found, returning seed cylinder"
+        )
+
+    # Map seed inliers to global indices
+    if initial_cylinder.inlier_indices is not None:
+        seed_inlier_global = seed_indices[initial_cylinder.inlier_indices]
+    else:
+        seed_inlier_global = seed_indices
+
+    # Expand using selected method
+    if expand_method == "bfs":
+        expanded_indices = _expand_bfs(
+            points, candidate_global_indices, seed_inlier_global, grow_radius
+        )
+    else:
+        expanded_indices = _expand_component(
+            points, candidate_global_indices, seed_inlier_global, grow_radius
+        )
+
+    if verbose:
+        print(f"  Expanded region ({expand_method}): {len(expanded_indices)} points")
+
+    if len(expanded_indices) < 6:
+        return SeedExpandCylinderResult(
+            cylinder=initial_cylinder,
+            expanded_inlier_indices=seed_inlier_global,
+            expanded_inlier_count=len(seed_inlier_global),
+            seed_inlier_indices=seed_indices,
+            success=True, message="Expansion resulted in too few points"
+        )
+
+    # Recompute cylinder parameters from expanded inliers
+    expanded_points = points[expanded_indices]
+    centroid = expanded_points.mean(axis=0)
+    centered = expanded_points - centroid
+    _, _, vh = np.linalg.svd(centered)
+    new_axis_dir = vh[0]
+    new_axis_dir = new_axis_dir / np.linalg.norm(new_axis_dir)
+
+    # Orient consistently
+    if np.dot(new_axis_dir, axis_dir) < 0:
+        new_axis_dir = -new_axis_dir
+
+    # Recompute radius and length
+    diff = expanded_points - centroid
+    projections = diff @ new_axis_dir
+    radial_vec = diff - np.outer(projections, new_axis_dir)
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+    new_radius = float(np.median(radial_dist))
+    new_length = float(np.max(projections) - np.min(projections))
+
+    if verbose:
+        print(f"  Final: {len(expanded_indices)} inliers, radius={new_radius:.4f}m, length={new_length:.3f}m")
+
+    final_cylinder = CylinderParam(
+        axis_point=centroid,
+        axis_direction=new_axis_dir,
+        radius=new_radius,
+        length=new_length,
+        inlier_count=len(expanded_indices),
+        inlier_indices=expanded_indices
+    )
+
+    return SeedExpandCylinderResult(
+        cylinder=final_cylinder,
+        expanded_inlier_indices=expanded_indices,
+        expanded_inlier_count=len(expanded_indices),
+        seed_inlier_indices=seed_indices,
+        success=True,
+        message="Cylinder expansion successful"
+    )
+
+
 def extract_stair_planes(
     points: np.ndarray,
     max_planes: int = 20,
