@@ -244,6 +244,7 @@ class AdaptiveROIResult:
     point_count: int
     success: bool
     message: str
+    center: Optional[np.ndarray] = None
 
 
 class ROISelector:
@@ -254,6 +255,7 @@ class ROISelector:
         self.selected_indices: Optional[np.ndarray] = None
         self.vis = None
         self._pcd_tree: Optional[o3d.geometry.KDTreeFlann] = None
+        self.last_center: Optional[np.ndarray] = None
 
     def _get_kdtree(self) -> o3d.geometry.KDTreeFlann:
         """Lazily build and cache KD-tree."""
@@ -311,6 +313,7 @@ class ROISelector:
         center_idx = picked_indices[0]
         center_point = np.asarray(self.pcd.points)[center_idx]
         print(f"Selected center point: {center_point}")
+        self.last_center = center_point
 
         # Adaptive radius expansion
         pcd_tree = self._get_kdtree()
@@ -357,7 +360,8 @@ class ROISelector:
             final_radius=final_radius,
             point_count=len(roi_pcd.points),
             success=point_count >= min_points,
-            message=f"ROI selected with {len(roi_pcd.points)} points at radius {final_radius:.2f}m"
+            message=f"ROI selected with {len(roi_pcd.points)} points at radius {final_radius:.2f}m",
+            center=center_point,
         )
 
     def select_roi_picking(self, radius: float = 0.1) -> Optional[o3d.geometry.PointCloud]:
@@ -391,6 +395,7 @@ class ROISelector:
         center_idx = picked_indices[0]
         center_point = np.asarray(self.pcd.points)[center_idx]
         print(f"Selected center point: {center_point}")
+        self.last_center = center_point
 
         # Find all points within radius
         pcd_tree = self._get_kdtree()
@@ -446,6 +451,7 @@ class ROISelector:
 
         bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
         roi_pcd = self.pcd.crop(bbox)
+        self.last_center = bbox.get_center()
 
         if roi_pcd.is_empty():
             print("No points in crop region")
@@ -458,6 +464,75 @@ class ROISelector:
 # =============================================================================
 # Visualization
 # =============================================================================
+
+def create_context_cloud(
+    pcd: o3d.geometry.PointCloud,
+    voxel_size: float,
+    *,
+    center: Optional[np.ndarray] = None,
+    radius: Optional[float] = None,
+) -> Optional[o3d.geometry.PointCloud]:
+    """
+    Create a lightly downsampled context cloud for visualization.
+
+    Optionally limits the context to points within the given radius
+    of the specified center.
+    """
+    if pcd.is_empty():
+        return None
+
+    if radius is not None and radius > 0.0 and center is not None:
+        center_arr = np.asarray(center, dtype=float).reshape(3)
+        pts = np.asarray(pcd.points)
+        if len(pts) == 0:
+            return None
+        mask = np.linalg.norm(pts - center_arr[None, :], axis=1) <= radius
+        if not np.any(mask):
+            return None
+
+        base = o3d.geometry.PointCloud()
+        base.points = o3d.utility.Vector3dVector(pts[mask])
+        if pcd.has_normals():
+            normals = np.asarray(pcd.normals)
+            if normals.shape == pts.shape:
+                base.normals = o3d.utility.Vector3dVector(normals[mask])
+    else:
+        base = o3d.geometry.PointCloud(pcd)
+
+    if voxel_size is not None and voxel_size > 0.0:
+        base = base.voxel_down_sample(voxel_size)
+
+    if base.is_empty():
+        return None
+
+    base.paint_uniform_color([0.85, 0.85, 0.85])  # Light gray context
+    return base
+
+
+def create_wireframe_sphere(
+    center: Optional[np.ndarray],
+    radius: float,
+    color: Tuple[float, float, float] = (1.0, 0.85, 0.2),
+    resolution: int = 12,
+) -> Optional[o3d.geometry.LineSet]:
+    """
+    Create a wireframe sphere to visualize ROI/seed radius.
+    """
+    if center is None or radius is None or radius <= 0.0:
+        return None
+
+    try:
+        sphere_mesh = o3d.geometry.TriangleMesh.create_sphere(
+            radius=radius,
+            resolution=max(resolution, 5),
+        )
+        sphere_mesh.translate(np.asarray(center, dtype=float))
+        sphere_lines = o3d.geometry.LineSet.create_from_triangle_mesh(sphere_mesh)
+        sphere_lines.paint_uniform_color(color)
+        return sphere_lines
+    except Exception:
+        return None
+
 
 def visualize_plane_fit(
     pcd: o3d.geometry.PointCloud,
@@ -899,6 +974,9 @@ def visualize_stair_planes(
     planes: List[PlaneParam],
     show_roi_points: bool = True,
     patch_shape: str = "hull",
+    context_pcd: Optional[o3d.geometry.PointCloud] = None,
+    roi_center: Optional[np.ndarray] = None,
+    roi_radius: Optional[float] = None,
 ):
     """
     Visualize multiple stair planes with the ROI point cloud.
@@ -908,14 +986,24 @@ def visualize_stair_planes(
         planes: List of PlaneParam for detected planes
         show_roi_points: If True, show ROI points in light gray
         patch_shape: 'hull' or 'rect' for patch generation
+        context_pcd: Downsampled background point cloud to show context
+        roi_center: Center of ROI selection (for context radius visualization)
+        roi_radius: ROI radius (drawn as wireframe sphere when provided)
     """
     geometries = []
     roi_points = np.asarray(roi_pcd.points)
 
+    if context_pcd is not None and not context_pcd.is_empty():
+        geometries.append(context_pcd)
+
+    roi_sphere = create_wireframe_sphere(roi_center, roi_radius)
+    if roi_sphere is not None:
+        geometries.append(roi_sphere)
+
     # Add ROI point cloud in light gray
     if show_roi_points:
         roi_vis = o3d.geometry.PointCloud(roi_pcd)
-        roi_vis.paint_uniform_color([0.8, 0.8, 0.8])  # Light gray
+        roi_vis.paint_uniform_color([0.6, 0.6, 0.6])  # Darker gray than context
         geometries.append(roi_vis)
 
     # Generate colors for planes
@@ -962,8 +1050,14 @@ def visualize_stair_planes(
             geometries.append(inlier_pcd)
 
     print(f"\nVisualization: {len(planes)} plane patches")
-    print("  - Light gray: ROI points")
-    print("  - Colored patches: Detected stair planes")
+    legend = [
+        "Colored patches: Detected stair planes",
+        "Gray points: ROI (darker) and optional context (lighter)",
+        "Wireframe sphere: ROI radius" if roi_sphere is not None else None,
+    ]
+    for line in legend:
+        if line:
+            print(f"  - {line}")
 
     o3d.visualization.draw_geometries(
         geometries,
@@ -1185,6 +1279,26 @@ def parse_args():
         default="hull",
         choices=["hull", "rect"],
         help="Plane patch shape: convex hull or oriented rectangle (default: hull)"
+    )
+
+    # Visualization options
+    viz_group = parser.add_argument_group("Visualization Options")
+    viz_group.add_argument(
+        "--show-context",
+        action="store_true",
+        help="Show downsampled original cloud as light-gray background in visualizations"
+    )
+    viz_group.add_argument(
+        "--context-voxel",
+        type=float,
+        default=0.10,
+        help="Voxel size for the background context cloud (default: 0.10m)"
+    )
+    viz_group.add_argument(
+        "--context-radius",
+        type=float,
+        default=None,
+        help="If set, only show context points within this radius of the ROI/seed center"
     )
 
     # Sensor profile
@@ -1611,14 +1725,19 @@ def visualize_seed_expand_plane(
     *,
     patch_mesh: Optional[o3d.geometry.TriangleMesh] = None,
     patch_shape: str = "hull",
+    context_pcd: Optional[o3d.geometry.PointCloud] = None,
+    roi_radius: Optional[float] = None,
 ):
     """Visualize seed-expand plane result."""
     geometries = []
 
-    # Original point cloud in light gray
-    pcd_gray = o3d.geometry.PointCloud(pcd)
-    pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
-    geometries.append(pcd_gray)
+    # Background/context point cloud
+    if context_pcd is not None and not context_pcd.is_empty():
+        geometries.append(context_pcd)
+    else:
+        pcd_gray = o3d.geometry.PointCloud(pcd)
+        pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
+        geometries.append(pcd_gray)
 
     # Seed region points (if available)
     if result.seed_inlier_indices is not None and len(result.seed_inlier_indices) > 0:
@@ -1649,6 +1768,10 @@ def visualize_seed_expand_plane(
         except Exception as e:
             print(f"  Warning: Could not create plane patch mesh: {e}")
 
+    roi_sphere = create_wireframe_sphere(seed_center, roi_radius)
+    if roi_sphere is not None:
+        geometries.append(roi_sphere)
+
     # Seed center marker
     seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
     seed_marker.translate(seed_center)
@@ -1657,11 +1780,13 @@ def visualize_seed_expand_plane(
     geometries.append(seed_marker)
 
     print("\nVisualization:")
-    print("  - Gray: Original point cloud")
+    print("  - Gray: Context/original point cloud")
     print("  - Blue: Seed region points")
     print("  - Red: Expanded inlier points")
     print("  - Green patch: Fitted plane")
     print("  - Yellow sphere: Seed center")
+    if roi_sphere is not None:
+        print("  - Orange wireframe: Seed radius")
 
     o3d.visualization.draw_geometries(
         geometries,
@@ -1673,15 +1798,21 @@ def visualize_seed_expand_cylinder(
     pcd: o3d.geometry.PointCloud,
     result: SeedExpandCylinderResult,
     seed_center: np.ndarray,
-    all_points: np.ndarray
+    all_points: np.ndarray,
+    *,
+    context_pcd: Optional[o3d.geometry.PointCloud] = None,
+    roi_radius: Optional[float] = None,
 ):
     """Visualize seed-expand cylinder result."""
     geometries = []
 
-    # Original point cloud in light gray
-    pcd_gray = o3d.geometry.PointCloud(pcd)
-    pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
-    geometries.append(pcd_gray)
+    # Background/context point cloud
+    if context_pcd is not None and not context_pcd.is_empty():
+        geometries.append(context_pcd)
+    else:
+        pcd_gray = o3d.geometry.PointCloud(pcd)
+        pcd_gray.paint_uniform_color([0.7, 0.7, 0.7])
+        geometries.append(pcd_gray)
 
     # Seed region points
     if result.seed_inlier_indices is not None and len(result.seed_inlier_indices) > 0:
@@ -1730,6 +1861,10 @@ def visualize_seed_expand_cylinder(
         axis_line.colors = o3d.utility.Vector3dVector([[1.0, 1.0, 0.0]])
         geometries.append(axis_line)
 
+    roi_sphere = create_wireframe_sphere(seed_center, roi_radius)
+    if roi_sphere is not None:
+        geometries.append(roi_sphere)
+
     # Seed center marker
     seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
     seed_marker.translate(seed_center)
@@ -1738,11 +1873,13 @@ def visualize_seed_expand_cylinder(
     geometries.append(seed_marker)
 
     print("\nVisualization:")
-    print("  - Gray: Original point cloud")
+    print("  - Gray: Context/original point cloud")
     print("  - Blue points: Seed region")
     print("  - Red points: Expanded inliers")
     print("  - Blue cylinder: Fitted cylinder mesh")
     print("  - Yellow line: Cylinder axis")
+    if roi_sphere is not None:
+        print("  - Orange wireframe: Seed radius")
 
     o3d.visualization.draw_geometries(
         geometries,
@@ -1880,6 +2017,30 @@ def run_seed_expand_mode(
     seed_center = all_points[seed_idx]
     print(f"Selected seed center: {np.round(seed_center, 4).tolist()}")
 
+    context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+    context_pcd = None
+    if args.show_context:
+        context_center = seed_center if context_radius is not None else None
+        context_pcd = create_context_cloud(
+            pcd,
+            args.context_voxel,
+            center=context_center,
+            radius=context_radius,
+        )
+        if context_pcd is None:
+            print(
+                "Context cloud is empty after downsampling/radius filter; "
+                "visualization will fall back to the original cloud."
+            )
+        else:
+            radius_info = (
+                f"radius={context_radius}m" if context_radius is not None else "full cloud"
+            )
+            print(
+                f"Prepared context cloud: {len(context_pcd.points)} points "
+                f"({radius_info}, voxel={args.context_voxel})"
+            )
+
     # Select primitive type
     print("\nSelect primitive type:")
     print("  [p] Plane")
@@ -1980,6 +2141,8 @@ def run_seed_expand_mode(
                 all_points,
                 patch_mesh=patch_mesh,
                 patch_shape=args.patch_shape,
+                context_pcd=context_pcd,
+                roi_radius=args.seed_radius,
             )
 
             # Save results
@@ -2031,7 +2194,14 @@ def run_seed_expand_mode(
             print(f"  Expanded inliers: {result.expanded_inlier_count}")
 
             # Visualize
-            visualize_seed_expand_cylinder(pcd, result, seed_center, all_points)
+            visualize_seed_expand_cylinder(
+                pcd,
+                result,
+                seed_center,
+                all_points,
+                context_pcd=context_pcd,
+                roi_radius=args.seed_radius,
+            )
 
             # Save results
             save_seed_expand_result(result, "cylinder", output_file, seed_center, seed_params)
@@ -2082,6 +2252,8 @@ def run_stairs_mode(
     print(f"  Horizontal filter: {'OFF' if args.no_horizontal_filter else 'ON'}")
     print(f"  Height merge: {'OFF' if args.no_height_merge else 'ON'}")
 
+    roi_center: Optional[np.ndarray] = None
+    roi_radius_used: Optional[float] = None
     roi_selector = ROISelector(pcd)
 
     # Show point cloud first
@@ -2096,6 +2268,8 @@ def run_stairs_mode(
         if roi_pcd is None or roi_pcd.is_empty():
             print("ROI selection cancelled or empty")
             return
+        roi_center = roi_selector.last_center
+        roi_radius_used = profile.r_min
     else:
         roi_result = roi_selector.select_roi_adaptive(
             r_min=profile.r_min,
@@ -2109,6 +2283,8 @@ def run_stairs_mode(
             return
 
         roi_pcd = roi_result.roi_pcd
+        roi_center = roi_result.center
+        roi_radius_used = roi_result.final_radius
 
         if not roi_result.success:
             print("\nWARNING: ROI has fewer points than required.")
@@ -2120,6 +2296,32 @@ def run_stairs_mode(
     # Get points from ROI
     points = np.asarray(roi_pcd.points)
     print(f"\nROI contains {len(points)} points")
+
+    context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+    context_pcd = None
+    if args.show_context:
+        context_center = roi_center if context_radius is not None else None
+        if args.context_radius is not None and args.context_radius > 0.0 and context_center is None:
+            print("Context radius specified but ROI center unavailable; showing full cloud instead.")
+        context_pcd = create_context_cloud(
+            pcd,
+            args.context_voxel,
+            center=context_center,
+            radius=context_radius,
+        )
+        if context_pcd is None:
+            print(
+                "Context cloud is empty after downsampling/radius filter; "
+                "visualization will show ROI and patches only."
+            )
+        else:
+            radius_info = (
+                f"radius={context_radius}m" if context_radius is not None else "full cloud"
+            )
+            print(
+                f"Prepared context cloud: {len(context_pcd.points)} points "
+                f"({radius_info}, voxel={args.context_voxel})"
+            )
 
     # Extract stair planes
     planes = extract_stair_planes(
@@ -2140,7 +2342,14 @@ def run_stairs_mode(
         return
 
     # Visualize results
-    visualize_stair_planes(roi_pcd, planes, patch_shape=args.patch_shape)
+    visualize_stair_planes(
+        roi_pcd,
+        planes,
+        patch_shape=args.patch_shape,
+        context_pcd=context_pcd,
+        roi_center=roi_center,
+        roi_radius=roi_radius_used,
+    )
 
     # Save results to JSON
     save_stairs_results(planes, points, args.stairs_output, patch_shape=args.patch_shape)
