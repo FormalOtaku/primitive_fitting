@@ -218,6 +218,104 @@ python main.py -i scan.pcd --stairs-mode \
 - 適切な距離閾値（plane_distance_threshold=0.025）
 - 十分な最小点数（min_points=200）
 
+## Seed-Expand Mode (種→拡張モード)
+
+GUIでクリックした"種（seed）"から、同一構造（床面・踊り場・配管一本）へ領域を拡張して抽出するモードです。
+
+### 基本的な使い方
+
+```bash
+# 平面の seed-expand（床面や踊り場）
+python main.py -i scan.pcd --seed-expand
+
+# 円柱の seed-expand（配管）
+python main.py -i scan.pcd --seed-expand --sensor-profile mid70_map
+
+# パラメータをカスタマイズ
+python main.py -i scan.pcd --seed-expand \
+    --seed-radius 0.3 \
+    --max-expand-radius 5.0 \
+    --grow-radius 0.15 \
+    --expand-method component
+```
+
+### Seed-Expand の動作
+
+1. 点群を表示 → ビューワを閉じる
+2. Shift+クリックで seed 中心点を選択
+3. プリミティブタイプ（p:平面 / c:円柱）を選択
+4. seed-radius 内の点から初期モデルをフィット
+5. max-expand-radius 内で連結な同一構造点を拡張抽出
+6. 結果を可視化し、JSON と PLY（オプション）に保存
+
+### Seed-Expand オプション
+
+| 引数 | 説明 | デフォルト |
+|------|------|------------|
+| `--seed-expand` | seed-expand モードを有効化 | - |
+| `--seed-radius` | 初期モデル推定用の半径（m） | 0.3 |
+| `--max-expand-radius` | 拡張上限の半径（m） | 5.0 |
+| `--grow-radius` | 連結判定/成長の近傍半径（m） | 0.15 |
+| `--expand-method` | 拡張方法: `component`（連結成分）または `bfs`（幅優先探索） | component |
+| `--max-refine-iters` | 平面再フィットの反復回数 | 3 |
+| `--normal-th` | 法線条件の角度閾値（度）。法線が無い場合はスキップ | 30.0 |
+| `--seed-output` | 結果出力先 JSON ファイル | seed_expand_results.json |
+| `--export-inliers` | 拡張点群の PLY 出力先（デバッグ用） | - |
+
+### 拡張アルゴリズム
+
+**component（連結成分法）**:
+1. 平面/円柱条件を満たす全候補点を収集
+2. grow-radius で近傍グラフを構築
+3. seed から連結な成分のみを抽出
+
+**bfs（幅優先探索法）**:
+1. seed inlier を起点に BFS を開始
+2. grow-radius 内の近傍で条件を満たす点を追加
+3. 到達可能な全点を抽出
+
+### 推奨パラメータ
+
+**mid70_map / mid70_stairs 向け**:
+```bash
+# 床面・踊り場（大きな平面）
+--seed-radius 0.5 --max-expand-radius 8.0 --grow-radius 0.2
+
+# 配管（細長い円柱）
+--seed-radius 0.2 --max-expand-radius 3.0 --grow-radius 0.1
+```
+
+### 出力形式
+
+#### JSON (seed_expand_results.json)
+
+```json
+{
+  "mode": "seed_expand",
+  "primitive_type": "plane",
+  "seed_center": [1.0, 2.0, 0.5],
+  "success": true,
+  "expanded_inlier_count": 1500,
+  "plane": {
+    "normal": [0.0, 0.0, 1.0],
+    "point": [1.0, 2.0, 0.5],
+    "inlier_count": 1500
+  },
+  "area": 4.5,
+  "extent_u": 2.1,
+  "extent_v": 2.3
+}
+```
+
+#### 可視化の色分け
+
+- **灰色**: 元の点群
+- **青**: seed 領域の点
+- **赤**: 拡張された inlier 点
+- **緑パッチ**: フィットされた平面メッシュ
+- **青シリンダー**: フィットされた円柱メッシュ
+- **黄色球**: seed 中心点
+
 ## Notes
 
 - v0 は研究用プロトタイプ。`fit_plane` / `fit_cylinder` はスタブ実装

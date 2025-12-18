@@ -10,3 +10,13 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# local outputs
+fit_results.json
+seed_expand_results.json
+stairs_results.json
+*.ply
+*.obj
+
+# local work dir
+work/
