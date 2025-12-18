@@ -21,7 +21,7 @@ from primitives import (
     SeedExpandPlaneResult, SeedExpandCylinderResult
 )
 
-SEED_EXPAND_RESULT_VERSION = 2
+SEED_EXPAND_RESULT_VERSION = 3
 
 
 # =============================================================================
@@ -651,20 +651,84 @@ def _polygon_area_2d(poly: np.ndarray) -> float:
     return 0.5 * float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
 
 
+def _minimum_area_bounding_rectangle(
+    hull_2d: np.ndarray
+) -> Optional[Tuple[np.ndarray, float, Tuple[float, float]]]:
+    """
+    Compute the minimum-area bounding rectangle of a 2D convex hull.
+
+    Returns:
+        (rect_corners, area, (extent_u, extent_v)) or None if degenerate.
+        rect_corners are in counter-clockwise order.
+    """
+    hull_2d = np.asarray(hull_2d, dtype=float)
+    if hull_2d.ndim != 2 or hull_2d.shape[1] != 2 or len(hull_2d) < 3:
+        return None
+
+    best_area = float("inf")
+    best_rect: Optional[np.ndarray] = None
+    best_extents: Optional[Tuple[float, float]] = None
+
+    num = len(hull_2d)
+    for i in range(num):
+        p0 = hull_2d[i]
+        p1 = hull_2d[(i + 1) % num]
+        edge = p1 - p0
+        edge_norm = float(np.linalg.norm(edge))
+        if edge_norm < 1e-12 or not np.isfinite(edge_norm):
+            continue
+
+        c = edge[0] / edge_norm
+        s = edge[1] / edge_norm
+        # Rotate by -theta so edge aligns with +x axis
+        rot = np.array([[c, s], [-s, c]])
+        rotated = hull_2d @ rot.T
+
+        min_x, max_x = float(rotated[:, 0].min()), float(rotated[:, 0].max())
+        min_y, max_y = float(rotated[:, 1].min()), float(rotated[:, 1].max())
+
+        extent_u = max_x - min_x
+        extent_v = max_y - min_y
+        area = extent_u * extent_v
+        if not np.isfinite(area):
+            continue
+
+        if area < best_area:
+            best_area = area
+            # Rotate corners back to original orientation
+            inv_rot = np.array([[c, -s], [s, c]])
+            rect = np.array(
+                [
+                    [min_x, min_y],
+                    [max_x, min_y],
+                    [max_x, max_y],
+                    [min_x, max_y],
+                ],
+                dtype=float,
+            )
+            best_rect = rect @ inv_rot.T
+            best_extents = (float(extent_u), float(extent_v))
+
+    if best_rect is None or best_extents is None or best_area <= 0.0:
+        return None
+    return best_rect, float(best_area), best_extents
+
+
 def create_plane_patch_mesh(
     plane: PlaneParam,
     roi_points: np.ndarray,
     color: np.ndarray,
     *,
     padding: float = 0.0,
-    use_convex_hull: bool = True,
-) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, float]]:
+    patch_shape: str = "hull",
+) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, object]]:
     """
     Create a plane patch mesh from inlier points.
 
     - Inliers are projected onto the plane
     - A 2D convex hull is computed in plane-local coordinates
-    - The hull is triangulated (fan triangulation)
+    - Patch shape is either the hull polygon or the minimum-area oriented rectangle
+    - The patch polygon is triangulated (fan triangulation)
     - Vertex colors are assigned (PLY keeps them)
     """
     roi_points = np.asarray(roi_points, dtype=float)
@@ -701,16 +765,13 @@ def create_plane_patch_mesh(
     extent_u = float(coords[:, 0].max() - coords[:, 0].min())
     extent_v = float(coords[:, 1].max() - coords[:, 1].min())
 
-    hull_2d: np.ndarray
-    if use_convex_hull:
-        hull_2d = _convex_hull_2d(coords)
-        if len(hull_2d) < 3:
-            use_convex_hull = False
+    hull_2d = _convex_hull_2d(coords)
+    hull_area = _polygon_area_2d(hull_2d)
 
-    if not use_convex_hull:
+    def axis_aligned_bbox() -> np.ndarray:
         min_u, max_u = float(coords[:, 0].min()), float(coords[:, 0].max())
         min_v, max_v = float(coords[:, 1].min()), float(coords[:, 1].max())
-        hull_2d = np.array(
+        return np.array(
             [
                 [min_u, min_v],
                 [max_u, min_v],
@@ -720,14 +781,48 @@ def create_plane_patch_mesh(
             dtype=float,
         )
 
-    if padding > 0:
-        centroid_2d = hull_2d.mean(axis=0)
-        vec = hull_2d - centroid_2d
-        norms = np.linalg.norm(vec, axis=1, keepdims=True)
-        hull_2d = centroid_2d + vec * ((norms + padding) / np.maximum(norms, 1e-9))
+    hull_valid = len(hull_2d) >= 3
+    requested_shape = patch_shape.lower()
+    selected_shape = requested_shape if requested_shape in ("hull", "rect") else "hull"
+    fallback_reason = ""
+    rect_corners_2d: Optional[np.ndarray] = None
+    rect_extents: Optional[Tuple[float, float]] = None
 
-    area = _polygon_area_2d(hull_2d)
-    vertices = origin + hull_2d[:, 0:1] * u[None, :] + hull_2d[:, 1:2] * v[None, :]
+    if selected_shape == "rect" and hull_valid:
+        rect_result = _minimum_area_bounding_rectangle(hull_2d)
+        if rect_result is not None:
+            rect_corners_2d, rect_area, rect_extents = rect_result
+            if rect_area < 1e-12 or min(rect_extents) < 1e-8:
+                rect_corners_2d = None
+        if rect_corners_2d is None:
+            selected_shape = "hull"
+            fallback_reason = "rect_degenerate"
+    elif selected_shape == "rect" and not hull_valid:
+        selected_shape = "hull"
+        fallback_reason = "insufficient_hull_points"
+
+    if selected_shape == "rect" and rect_corners_2d is not None:
+        polygon_2d = rect_corners_2d
+    elif hull_valid:
+        polygon_2d = hull_2d
+    else:
+        polygon_2d = axis_aligned_bbox()
+
+    if padding > 0:
+        centroid_2d = polygon_2d.mean(axis=0)
+        vec = polygon_2d - centroid_2d
+        norms = np.linalg.norm(vec, axis=1, keepdims=True)
+        polygon_2d = centroid_2d + vec * ((norms + padding) / np.maximum(norms, 1e-9))
+
+    vertices = origin + polygon_2d[:, 0:1] * u[None, :] + polygon_2d[:, 1:2] * v[None, :]
+
+    if len(vertices) >= 3:
+        poly_normal = np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])
+        if float(np.dot(poly_normal, normal)) < 0:
+            polygon_2d = polygon_2d[::-1]
+            vertices = vertices[::-1]
+
+    area = _polygon_area_2d(polygon_2d)
 
     triangles = np.array([[0, i, i + 1] for i in range(1, len(vertices) - 1)], dtype=int)
     if len(triangles) == 0:
@@ -739,7 +834,34 @@ def create_plane_patch_mesh(
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.tile(color, (len(vertices), 1)))
     mesh.compute_vertex_normals()
 
-    return mesh, {"extent_u": extent_u, "extent_v": extent_v, "area": float(area)}
+    rect_corners_world = None
+    if selected_shape == "rect" and len(polygon_2d) == 4:
+        rect_corners_world = origin + polygon_2d[:, 0:1] * u[None, :] + polygon_2d[:, 1:2] * v[None, :]
+        edge_u_vec = polygon_2d[1] - polygon_2d[0]
+        edge_v_vec = polygon_2d[3] - polygon_2d[0]
+        rect_extents = (
+            float(np.linalg.norm(edge_u_vec)),
+            float(np.linalg.norm(edge_v_vec)),
+        )
+
+    metrics: Dict[str, object] = {
+        "extent_u": extent_u,
+        "extent_v": extent_v,
+        "area": float(area),
+        "hull_area": float(hull_area),
+        "patch_shape": selected_shape,
+        "patch_shape_requested": requested_shape,
+    }
+    if rect_corners_world is not None:
+        metrics["rect_corners_world"] = rect_corners_world
+    if rect_extents is not None:
+        metrics["rect_extent_u"] = float(rect_extents[0])
+        metrics["rect_extent_v"] = float(rect_extents[1])
+        metrics["rect_area"] = float(metrics["rect_extent_u"] * metrics["rect_extent_v"])
+    if fallback_reason:
+        metrics["patch_fallback_reason"] = fallback_reason
+
+    return mesh, metrics
 
 
 def _combine_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> o3d.geometry.TriangleMesh:
@@ -775,7 +897,8 @@ def _combine_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> o3d.geometry.Tri
 def visualize_stair_planes(
     roi_pcd: o3d.geometry.PointCloud,
     planes: List[PlaneParam],
-    show_roi_points: bool = True
+    show_roi_points: bool = True,
+    patch_shape: str = "hull",
 ):
     """
     Visualize multiple stair planes with the ROI point cloud.
@@ -784,6 +907,7 @@ def visualize_stair_planes(
         roi_pcd: Point cloud of the ROI
         planes: List of PlaneParam for detected planes
         show_roi_points: If True, show ROI points in light gray
+        patch_shape: 'hull' or 'rect' for patch generation
     """
     geometries = []
     roi_points = np.asarray(roi_pcd.points)
@@ -800,17 +924,32 @@ def visualize_stair_planes(
     # Create mesh for each plane
     for i, (plane, color) in enumerate(zip(planes, colors)):
         try:
-            mesh, metrics = create_plane_patch_mesh(plane, roi_points, color, padding=0.02, use_convex_hull=True)
+            mesh, metrics = create_plane_patch_mesh(
+                plane, roi_points, color, padding=0.02, patch_shape=patch_shape
+            )
             geometries.append(mesh)
 
             height = float(plane.height) if plane.height is not None else float(np.asarray(plane.point)[2])
             nz = float(np.clip(np.asarray(plane.normal, dtype=float)[2], -1.0, 1.0))
             tilt_deg = float(np.rad2deg(np.arccos(abs(nz))))
             small_patch = metrics["area"] < 0.01 or min(metrics["extent_u"], metrics["extent_v"]) < 0.10
+            patch_info = f"patch={metrics.get('patch_shape', 'hull')}"
+            if metrics.get("patch_shape") == "rect":
+                rect_u = float(metrics.get("rect_extent_u", metrics.get("extent_u", 0.0)))
+                rect_v = float(metrics.get("rect_extent_v", metrics.get("extent_v", 0.0)))
+                patch_info += f" rect=({rect_u:.2f} x {rect_v:.2f})m area={metrics.get('area', 0.0):.3f}m^2"
+            else:
+                hull_area = float(metrics.get("hull_area", metrics.get("area", 0.0)))
+                patch_info += (
+                    f" area={metrics.get('area', 0.0):.3f}m^2"
+                    f" hull_area={hull_area:.3f}m^2"
+                )
+            if metrics.get("patch_fallback_reason"):
+                patch_info += f" fallback={metrics['patch_fallback_reason']}"
             print(
                 f"  [{i:02d}] height={height:+.3f}m tilt={tilt_deg:4.1f}deg "
                 f"inliers={plane.inlier_count:6d} extent=({metrics['extent_u']:.2f} x {metrics['extent_v']:.2f})m "
-                f"area={metrics['area']:.3f}m^2{'  <SMALL>' if small_patch else ''}"
+                f"{patch_info}{'  <SMALL>' if small_patch else ''}"
             )
         except Exception as exc:
             print(f"  [{i:02d}] Failed to create plane patch mesh: {type(exc).__name__}: {exc}")
@@ -836,7 +975,8 @@ def export_stair_planes_mesh(
     planes: List[PlaneParam],
     roi_points: np.ndarray,
     filepath: str,
-    padding: float = 0.0
+    padding: float = 0.0,
+    patch_shape: str = "hull",
 ):
     """
     Export all stair plane meshes to a single PLY file.
@@ -846,6 +986,7 @@ def export_stair_planes_mesh(
         roi_points: Points in the ROI
         filepath: Output file path (PLY or OBJ)
         padding: Padding around plane patches
+        patch_shape: 'hull' or 'rect' for patch generation
     """
     if len(planes) == 0:
         print("No planes to export")
@@ -856,14 +997,33 @@ def export_stair_planes_mesh(
 
     for i, (plane, color) in enumerate(zip(planes, colors)):
         try:
-            mesh, metrics = create_plane_patch_mesh(plane, roi_points, color, padding=padding, use_convex_hull=True)
+            mesh, metrics = create_plane_patch_mesh(
+                plane,
+                roi_points,
+                color,
+                padding=padding,
+                patch_shape=patch_shape,
+            )
             meshes.append(mesh)
             height = float(plane.height) if plane.height is not None else float(np.asarray(plane.point)[2])
             small_patch = metrics["area"] < 0.01 or min(metrics["extent_u"], metrics["extent_v"]) < 0.10
+            patch_info = f"patch={metrics.get('patch_shape', 'hull')}"
+            if metrics.get("patch_shape") == "rect":
+                rect_u = float(metrics.get("rect_extent_u", metrics.get("extent_u", 0.0)))
+                rect_v = float(metrics.get("rect_extent_v", metrics.get("extent_v", 0.0)))
+                patch_info += f" rect=({rect_u:.2f} x {rect_v:.2f})m area={metrics.get('area', 0.0):.3f}m^2"
+            else:
+                hull_area = float(metrics.get("hull_area", metrics.get("area", 0.0)))
+                patch_info += (
+                    f" area={metrics.get('area', 0.0):.3f}m^2"
+                    f" hull_area={hull_area:.3f}m^2"
+                )
+            if metrics.get("patch_fallback_reason"):
+                patch_info += f" fallback={metrics['patch_fallback_reason']}"
             print(
                 f"  Export[{i:02d}] height={height:+.3f}m inliers={plane.inlier_count:6d} "
                 f"extent=({metrics['extent_u']:.2f} x {metrics['extent_v']:.2f})m "
-                f"area={metrics['area']:.3f}m^2{'  <SMALL>' if small_patch else ''}"
+                f"{patch_info}{'  <SMALL>' if small_patch else ''}"
             )
         except Exception as exc:
             print(f"  Export[{i:02d}] skipped: {type(exc).__name__}: {exc}")
@@ -930,29 +1090,54 @@ def append_cylinder_result(results: dict, cylinder: CylinderParam) -> dict:
 
 def save_stairs_results(
     planes: List[PlaneParam],
-    filepath: str
+    roi_points: np.ndarray,
+    filepath: str,
+    *,
+    patch_shape: str = "hull",
 ):
     """
     Save stair plane results to JSON file.
 
     Args:
         planes: List of PlaneParam detected as stair planes
+        roi_points: Points in the ROI (for patch computation)
         filepath: Output JSON file path
+        patch_shape: Requested patch shape
     """
     result = {
         "mode": "stairs",
+        "version": 2,
         "plane_count": len(planes),
         "planes": []
     }
 
     for i, plane in enumerate(planes):
-        result["planes"].append({
+        plane_entry = {
             "id": i,
             "normal": plane.normal.tolist(),
             "point": plane.point.tolist(),
             "height": plane.height,
             "inlier_count": plane.inlier_count
-        })
+        }
+
+        try:
+            _, metrics = create_plane_patch_mesh(
+                plane,
+                roi_points,
+                np.array([0.5, 0.5, 0.5]),
+                padding=0.0,
+                patch_shape=patch_shape,
+            )
+            plane_entry["patch_shape"] = metrics.get("patch_shape", patch_shape)
+            if metrics.get("rect_corners_world") is not None:
+                plane_entry["rect_corners_world"] = np.asarray(metrics["rect_corners_world"]).tolist()
+            if metrics.get("patch_fallback_reason"):
+                plane_entry["patch_fallback_reason"] = metrics["patch_fallback_reason"]
+        except Exception as exc:
+            plane_entry["patch_shape"] = patch_shape
+            plane_entry["patch_error"] = str(exc)
+
+        result["planes"].append(plane_entry)
 
     with open(filepath, 'w') as f:
         json.dump(result, f, indent=2)
@@ -993,6 +1178,13 @@ def parse_args():
         type=str,
         default="fit_results.json",
         help="Output JSON file for results (default: fit_results.json)"
+    )
+    parser.add_argument(
+        "--patch-shape",
+        type=str,
+        default="hull",
+        choices=["hull", "rect"],
+        help="Plane patch shape: convex hull or oriented rectangle (default: hull)"
     )
 
     # Sensor profile
@@ -1415,7 +1607,10 @@ def visualize_seed_expand_plane(
     pcd: o3d.geometry.PointCloud,
     result: SeedExpandPlaneResult,
     seed_center: np.ndarray,
-    all_points: np.ndarray
+    all_points: np.ndarray,
+    *,
+    patch_mesh: Optional[o3d.geometry.TriangleMesh] = None,
+    patch_shape: str = "hull",
 ):
     """Visualize seed-expand plane result."""
     geometries = []
@@ -1442,14 +1637,15 @@ def visualize_seed_expand_plane(
     # Plane patch mesh in green
     if result.plane is not None and result.expanded_inlier_indices is not None:
         try:
-            mesh, metrics = create_plane_patch_mesh(
-                result.plane,
-                all_points,
-                np.array([0.0, 0.8, 0.0]),  # Green
-                padding=0.02,
-                use_convex_hull=True
-            )
-            geometries.append(mesh)
+            if patch_mesh is None:
+                patch_mesh, _ = create_plane_patch_mesh(
+                    result.plane,
+                    all_points,
+                    np.array([0.0, 0.8, 0.0]),  # Green
+                    padding=0.02,
+                    patch_shape=patch_shape,
+                )
+            geometries.append(patch_mesh)
         except Exception as e:
             print(f"  Warning: Could not create plane patch mesh: {e}")
 
@@ -1560,6 +1756,7 @@ def save_seed_expand_result(
     filepath: str,
     seed_center: np.ndarray,
     params: dict,
+    patch_metrics: Optional[Dict[str, object]] = None,
 ):
     """Save seed-expand result to JSON."""
     data = {
@@ -1598,6 +1795,16 @@ def save_seed_expand_result(
         data["area"] = result.area
         data["extent_u"] = result.extent_u
         data["extent_v"] = result.extent_v
+        if patch_metrics is not None:
+            plane_patch_shape = patch_metrics.get("patch_shape") if isinstance(patch_metrics, dict) else None
+            if plane_patch_shape:
+                data["plane"]["patch_shape"] = plane_patch_shape
+            if isinstance(patch_metrics, dict) and patch_metrics.get("rect_corners_world") is not None:
+                data["plane"]["rect_corners_world"] = np.asarray(
+                    patch_metrics["rect_corners_world"]
+                ).tolist()
+            if isinstance(patch_metrics, dict) and patch_metrics.get("patch_fallback_reason"):
+                data["plane"]["patch_fallback_reason"] = patch_metrics["patch_fallback_reason"]
     elif primitive_type == "cylinder" and result.cylinder is not None:
         data["cylinder"] = {
             "axis_point": result.cylinder.axis_point.tolist(),
@@ -1736,12 +1943,54 @@ def run_seed_expand_mode(
             print(f"  Expanded inliers: {result.expanded_inlier_count}")
             print(f"  Area: {result.area:.3f} m²")
             print(f"  Extent: ({result.extent_u:.2f} x {result.extent_v:.2f}) m")
+            patch_mesh = None
+            patch_metrics = None
+            try:
+                patch_mesh, patch_metrics = create_plane_patch_mesh(
+                    result.plane,
+                    all_points,
+                    np.array([0.0, 0.8, 0.0]),
+                    padding=0.02,
+                    patch_shape=args.patch_shape,
+                )
+                patch_shape_used = patch_metrics.get("patch_shape", args.patch_shape)
+                if patch_shape_used == "rect":
+                    rect_u = float(patch_metrics.get("rect_extent_u", 0.0))
+                    rect_v = float(patch_metrics.get("rect_extent_v", 0.0))
+                    print(
+                        f"  Patch: rect ({rect_u:.2f} x {rect_v:.2f}) m "
+                        f"area={float(patch_metrics.get('area', 0.0)):.3f} m²"
+                    )
+                else:
+                    hull_area = float(patch_metrics.get("hull_area", patch_metrics.get("area", 0.0)))
+                    print(
+                        f"  Patch: hull area={float(patch_metrics.get('area', 0.0)):.3f} m² "
+                        f"hull_area={hull_area:.3f} m²"
+                    )
+                if patch_metrics.get("patch_fallback_reason"):
+                    print(f"  Patch fallback: {patch_metrics['patch_fallback_reason']}")
+            except Exception as exc:
+                print(f"  Warning: Could not create plane patch mesh: {exc}")
 
             # Visualize
-            visualize_seed_expand_plane(pcd, result, seed_center, all_points)
+            visualize_seed_expand_plane(
+                pcd,
+                result,
+                seed_center,
+                all_points,
+                patch_mesh=patch_mesh,
+                patch_shape=args.patch_shape,
+            )
 
             # Save results
-            save_seed_expand_result(result, "plane", output_file, seed_center, seed_params)
+            save_seed_expand_result(
+                result,
+                "plane",
+                output_file,
+                seed_center,
+                seed_params,
+                patch_metrics=patch_metrics,
+            )
 
             # Export inliers if requested
             if args.export_inliers and result.expanded_inlier_indices is not None:
@@ -1891,14 +2140,14 @@ def run_stairs_mode(
         return
 
     # Visualize results
-    visualize_stair_planes(roi_pcd, planes)
+    visualize_stair_planes(roi_pcd, planes, patch_shape=args.patch_shape)
 
     # Save results to JSON
-    save_stairs_results(planes, args.stairs_output)
+    save_stairs_results(planes, points, args.stairs_output, patch_shape=args.patch_shape)
 
     # Export mesh if requested
     if args.export_mesh:
-        export_stair_planes_mesh(planes, points, args.export_mesh)
+        export_stair_planes_mesh(planes, points, args.export_mesh, patch_shape=args.patch_shape)
 
     # Summary
     print("\n" + "=" * 60)
