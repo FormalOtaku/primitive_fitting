@@ -2177,6 +2177,28 @@ def create_axis_line(
     return line
 
 
+def colorize_point_cloud_by_height(
+    pcd: o3d.geometry.PointCloud,
+    *,
+    axis: int = 2,
+) -> o3d.geometry.PointCloud:
+    """Apply a simple height colormap to a point cloud copy."""
+    colored = o3d.geometry.PointCloud(pcd)
+    pts = np.asarray(colored.points)
+    if pts.size == 0:
+        return colored
+    z = pts[:, axis]
+    z_min = float(np.min(z))
+    z_max = float(np.max(z))
+    if not np.isfinite(z_min) or not np.isfinite(z_max) or abs(z_max - z_min) < 1e-9:
+        colored.paint_uniform_color([0.7, 0.7, 0.7])
+        return colored
+    t = (z - z_min) / (z_max - z_min)
+    colors = np.column_stack([t, 0.2 + 0.6 * (1.0 - t), 1.0 - t])
+    colored.colors = o3d.utility.Vector3dVector(colors)
+    return colored
+
+
 def build_mesh_from_polygon(
     corners_world: np.ndarray,
     color: np.ndarray,
@@ -2445,36 +2467,37 @@ def run_session_mode(
     def show_scene_for_pick():
         vis = o3d.visualization.VisualizerWithEditing()
         vis.create_window(window_name="Session Pick (Shift+Click, close to confirm)")
-        if context_pcd is not None and not context_pcd.is_empty():
-            vis.add_geometry(context_pcd)
-        else:
-            vis.add_geometry(pcd)
+        pick_cloud = colorize_point_cloud_by_height(pcd)
+        vis.add_geometry(pick_cloud)
         for mesh in meshes:
             vis.add_geometry(mesh)
         vis.run()
         picked = vis.get_picked_points()
         vis.destroy_window()
-        return picked
+        pick_points = np.asarray(pick_cloud.points)
+        if not picked:
+            return None
+        idx = picked[0]
+        if idx < 0 or idx >= len(pick_points):
+            return None
+        return pick_points[idx]
 
     def show_scene():
         geometries = []
         if context_pcd is not None and not context_pcd.is_empty():
             geometries.append(context_pcd)
         else:
-            base = o3d.geometry.PointCloud(pcd)
-            base.paint_uniform_color([0.6, 0.6, 0.6])
+            base = colorize_point_cloud_by_height(pcd)
             geometries.append(base)
         geometries.extend(meshes)
         o3d.visualization.draw_geometries(geometries, window_name="Session Workspace")
 
     while True:
-        picked = show_scene_for_pick()
-        if not picked:
+        seed_center = show_scene_for_pick()
+        if seed_center is None:
             print("No point selected. Exiting session.")
             break
 
-        seed_idx = picked[0]
-        seed_center = all_points[seed_idx]
         print(f"\nSeed: {np.round(seed_center, 4).tolist()}")
 
         seed_indices, seed_radius = adaptive_seed_indices(

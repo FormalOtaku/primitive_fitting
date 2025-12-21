@@ -1034,8 +1034,14 @@ def _extract_connected_component(
 
     seed_unique = np.unique(seed_indices)
     pos = np.searchsorted(cand_global, seed_unique)
-    pos_ok = (pos < cand_global.size) & (cand_global[pos] == seed_unique)
-    seed_local = pos[pos_ok]
+    pos_ok = pos < cand_global.size
+    if np.any(pos_ok):
+        pos_valid = pos[pos_ok]
+        seed_valid = seed_unique[pos_ok]
+        match = cand_global[pos_valid] == seed_valid
+        seed_local = pos_valid[match]
+    else:
+        seed_local = np.empty((0,), dtype=int)
 
     if seed_local.size == 0:
         reason = "seed_not_in_candidates" if enforce_seed_in_component else ""
