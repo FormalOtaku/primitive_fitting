@@ -2188,12 +2188,13 @@ def colorize_point_cloud_by_height(
     if pts.size == 0:
         return colored
     z = pts[:, axis]
-    z_min = float(np.min(z))
-    z_max = float(np.max(z))
+    z_min = float(np.percentile(z, 5))
+    z_max = float(np.percentile(z, 95))
     if not np.isfinite(z_min) or not np.isfinite(z_max) or abs(z_max - z_min) < 1e-9:
         colored.paint_uniform_color([0.7, 0.7, 0.7])
         return colored
     t = (z - z_min) / (z_max - z_min)
+    t = np.clip(t, 0.0, 1.0)
     colors = np.column_stack([t, 0.2 + 0.6 * (1.0 - t), 1.0 - t])
     colored.colors = o3d.utility.Vector3dVector(colors)
     return colored
