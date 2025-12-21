@@ -3,6 +3,7 @@
 import numpy as np
 
 from primitives import (
+    CylinderParam,
     expand_plane_from_seed,
     expand_cylinder_from_seed,
 )
@@ -325,6 +326,117 @@ def test_expand_cylinder_bfs_method():
     assert result.success
     assert result.cylinder is not None
     assert result.expanded_inlier_count > 700
+
+
+def test_expand_cylinder_with_initial_prior():
+    """Test that a provided cylinder prior can drive expansion."""
+    rng = np.random.default_rng(146)
+
+    cylinder = _make_cylinder_grid_points(
+        axis_point=np.array([0.0, 0.0, 0.0]),
+        axis_dir=np.array([0.0, 0.0, 1.0]),
+        radius=0.12,
+        length=2.0,
+        n_theta=60,
+        n_t=40,
+        noise_std=0.001,
+        rng=rng,
+    )
+
+    seed_center = np.array([0.0, 0.0, 0.0])
+    initial = CylinderParam(
+        axis_point=np.array([0.0, 0.0, 0.0]),
+        axis_direction=np.array([0.0, 0.0, 1.0]),
+        radius=0.12,
+        length=2.0,
+        inlier_count=0,
+        inlier_indices=None,
+    )
+
+    result = expand_cylinder_from_seed(
+        cylinder,
+        seed_center,
+        initial_cylinder=initial,
+        seed_radius=0.05,
+        max_expand_radius=3.0,
+        grow_radius=0.2,
+        distance_threshold=0.02,
+        expand_method="component",
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.cylinder is not None
+    assert abs(result.cylinder.radius - 0.12) < 0.02
+    assert result.expanded_inlier_count > 1000
+
+
+def test_expand_cylinder_radius_length_reasonable():
+    """Test that cylinder radius/length are estimated reasonably."""
+    rng = np.random.default_rng(147)
+
+    radius = 0.2
+    length = 2.5
+    cylinder = _make_cylinder_grid_points(
+        axis_point=np.array([0.0, 0.0, 0.0]),
+        axis_dir=np.array([0.0, 0.0, 1.0]),
+        radius=radius,
+        length=length,
+        n_theta=72,
+        n_t=80,
+        noise_std=0.002,
+        rng=rng,
+    )
+
+    seed_center = np.array([0.0, 0.0, 0.0])
+
+    result = expand_cylinder_from_seed(
+        cylinder,
+        seed_center,
+        seed_radius=0.35,
+        max_expand_radius=4.0,
+        grow_radius=0.2,
+        distance_threshold=0.03,
+        expand_method="component",
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.cylinder is not None
+    assert abs(result.cylinder.radius - radius) < 0.04
+    assert abs(result.cylinder.length - length) < 0.4
+
+
+def test_expand_plane_area_positive():
+    """Test that plane area is positive for a simple plane."""
+    rng = np.random.default_rng(148)
+
+    plane = _make_horizontal_plane_points(
+        z=0.5,
+        x_range=(-1.5, 1.5),
+        y_range=(-1.0, 1.0),
+        n=1200,
+        noise_std=0.002,
+        rng=rng,
+    )
+
+    seed_center = np.array([0.0, 0.0, 0.5])
+
+    result = expand_plane_from_seed(
+        plane,
+        seed_center,
+        seed_radius=0.6,
+        max_expand_radius=4.0,
+        grow_radius=0.2,
+        distance_threshold=0.02,
+        expand_method="component",
+        verbose=False,
+    )
+
+    assert result.success
+    assert result.area > 0.1
+    assert result.extent_u > 0.1
+    assert result.extent_v > 0.1
 
 
 def test_expand_plane_too_few_seed_points():

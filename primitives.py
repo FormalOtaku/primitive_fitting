@@ -5,7 +5,7 @@ primitives.py - Primitive fitting functions for plane and cylinder
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import numpy as np
 import open3d as o3d
 
@@ -1233,8 +1233,55 @@ class SeedExpandCylinderResult:
     steps: int = 0
     max_frontier_size: int = 0
     residual_median: float = 0.0
+    residual_mad: float = 0.0
     residual_p90: float = 0.0
     residual_p95: float = 0.0
+
+
+@dataclass
+class CylinderProxyInit:
+    """Initial proxy cylinder estimate from a seed point."""
+    cylinder: Optional[CylinderParam]
+    seed_indices: np.ndarray
+    seed_radius: float
+    axis_dir_pca: Optional[np.ndarray]
+    seed_point_count: int
+    success: bool
+    message: str
+
+
+@dataclass
+class CylinderSurfaceExtractResult:
+    """Result of extracting cylinder surface points with connectivity."""
+    inlier_indices: np.ndarray
+    candidate_count: int
+    seed_inlier_count: int
+    stopped_early: bool
+    stop_reason: str
+    steps: int
+    max_frontier_size: int
+    success: bool
+    message: str
+
+
+@dataclass
+class CylinderProbeResult:
+    """Result of interactive cylinder probe extraction."""
+    proxy: Optional[CylinderParam]
+    final: Optional[CylinderParam]
+    inlier_indices: Optional[np.ndarray]
+    inlier_count: int
+    residual_median: float
+    residual_mad: float
+    candidate_count: int
+    stopped_early: bool
+    stop_reason: str
+    steps: int
+    max_frontier_size: int
+    success: bool
+    message: str
+    seed_radius: float = 0.0
+    seed_point_count: int = 0
 
 
 def expand_cylinder_from_seed(
@@ -1242,6 +1289,7 @@ def expand_cylinder_from_seed(
     seed_center: np.ndarray,
     normals: Optional[np.ndarray] = None,
     *,
+    initial_cylinder: Optional[CylinderParam] = None,
     seed_radius: float = 0.3,
     max_expand_radius: float = 5.0,
     grow_radius: float = 0.15,
@@ -1264,6 +1312,7 @@ def expand_cylinder_from_seed(
         points: (N, 3) array of 3D points
         seed_center: (3,) seed center point
         normals: (N, 3) array of point normals (optional)
+        initial_cylinder: Optional initial cylinder prior (axis/radius) to skip seed RANSAC
         seed_radius: radius for initial seed region
         max_expand_radius: maximum radius from seed center for expansion
         grow_radius: neighbor radius for connectivity
@@ -1313,7 +1362,7 @@ def expand_cylinder_from_seed(
     seed_mask = distances2_to_seed <= seed_radius2
     seed_indices = np.where(seed_mask)[0]
 
-    if len(seed_indices) < 6:
+    if len(seed_indices) < 6 and initial_cylinder is None:
         return SeedExpandCylinderResult(
             cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
             seed_inlier_indices=seed_indices, success=False,
@@ -1329,22 +1378,60 @@ def expand_cylinder_from_seed(
         ms = (time_seed - time_start) * 1000.0
         print(f"  Seed region: {len(seed_points)} points within {seed_radius}m ({ms:.1f} ms)")
 
-    # Step 2: Fit initial cylinder on seed points
-    initial_cylinder = fit_cylinder(
-        seed_points,
-        seed_normals,
-        distance_threshold=distance_threshold,
-        radius_min=radius_min,
-        radius_max=radius_max,
-        num_iterations=num_iterations
-    )
-
+    # Step 2: Fit initial cylinder on seed points (or use provided prior)
     if initial_cylinder is None:
-        return SeedExpandCylinderResult(
-            cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
-            seed_inlier_indices=seed_indices, success=False,
-            message="Failed to fit initial cylinder on seed points",
-            seed_point_count=len(seed_indices),
+        initial_cylinder = fit_cylinder(
+            seed_points,
+            seed_normals,
+            distance_threshold=distance_threshold,
+            radius_min=radius_min,
+            radius_max=radius_max,
+            num_iterations=num_iterations
+        )
+
+        if initial_cylinder is None:
+            return SeedExpandCylinderResult(
+                cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+                seed_inlier_indices=seed_indices, success=False,
+                message="Failed to fit initial cylinder on seed points",
+                seed_point_count=len(seed_indices),
+            )
+    else:
+        axis_dir = np.asarray(initial_cylinder.axis_direction, dtype=float).reshape(-1)
+        axis_point = np.asarray(initial_cylinder.axis_point, dtype=float).reshape(-1)
+        if axis_dir.size != 3 or axis_point.size != 3:
+            return SeedExpandCylinderResult(
+                cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+                seed_inlier_indices=seed_indices, success=False,
+                message="Initial cylinder axis must be 3D",
+                seed_point_count=len(seed_indices),
+            )
+        axis_norm = np.linalg.norm(axis_dir)
+        if not np.isfinite(axis_norm) or axis_norm < 1e-12:
+            return SeedExpandCylinderResult(
+                cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+                seed_inlier_indices=seed_indices, success=False,
+                message="Initial cylinder axis direction is invalid",
+                seed_point_count=len(seed_indices),
+            )
+        axis_dir = axis_dir / axis_norm
+        axis_dir = _orient_direction(axis_dir, prefer_positive_z=False)
+        cyl_radius = float(initial_cylinder.radius)
+        if not np.isfinite(cyl_radius) or cyl_radius <= 0:
+            return SeedExpandCylinderResult(
+                cylinder=None, expanded_inlier_indices=None, expanded_inlier_count=0,
+                seed_inlier_indices=seed_indices, success=False,
+                message="Initial cylinder radius is invalid",
+                seed_point_count=len(seed_indices),
+            )
+        cyl_length = float(initial_cylinder.length) if np.isfinite(initial_cylinder.length) else 0.0
+        initial_cylinder = CylinderParam(
+            axis_point=np.asarray(axis_point, dtype=float),
+            axis_direction=np.asarray(axis_dir, dtype=float),
+            radius=cyl_radius,
+            length=cyl_length,
+            inlier_count=0,
+            inlier_indices=None,
         )
 
     axis_point = initial_cylinder.axis_point
@@ -1396,8 +1483,32 @@ def expand_cylinder_from_seed(
             f"({ms:.1f} ms)"
         )
 
+    seed_inlier_global = seed_indices
+    if initial_cylinder.inlier_indices is not None:
+        seed_inlier_global = seed_indices[initial_cylinder.inlier_indices]
+    elif seed_indices.size > 0:
+        diff_seed = seed_points - axis_point
+        seed_proj = diff_seed @ axis_dir
+        radial_seed = diff_seed - np.outer(seed_proj, axis_dir)
+        radial_seed_dist = np.linalg.norm(radial_seed, axis=1)
+        seed_dist = np.abs(radial_seed_dist - cyl_radius)
+        seed_mask = seed_dist < distance_threshold
+        if has_normals:
+            radial_dir_seed = radial_seed / np.maximum(radial_seed_dist[:, None], 1e-8)
+            seed_normal_alignment = np.abs(np.einsum("ij,ij->i", radial_dir_seed, seed_normals))
+            seed_mask &= seed_normal_alignment > normal_cos_threshold
+        seed_inlier_global = seed_indices[np.where(seed_mask)[0]]
+
+    if seed_inlier_global.size == 0 and candidate_global_indices.size > 0:
+        candidate_points = points[candidate_global_indices]
+        delta_seed = candidate_points - seed_center
+        distances2 = np.einsum("ij,ij->i", delta_seed, delta_seed)
+        nearest = int(np.argmin(distances2))
+        seed_inlier_global = np.array([candidate_global_indices[nearest]], dtype=int)
+        if verbose:
+            print("  Seed had no cylinder inliers; using nearest candidate as seed")
+
     if len(candidate_local_indices) == 0:
-        seed_inlier_global = seed_indices[initial_cylinder.inlier_indices] if initial_cylinder.inlier_indices is not None else seed_indices
         return SeedExpandCylinderResult(
             cylinder=initial_cylinder,
             expanded_inlier_indices=seed_inlier_global,
@@ -1407,12 +1518,6 @@ def expand_cylinder_from_seed(
             seed_point_count=len(seed_indices),
             candidate_count=0,
         )
-
-    # Map seed inliers to global indices
-    if initial_cylinder.inlier_indices is not None:
-        seed_inlier_global = seed_indices[initial_cylinder.inlier_indices]
-    else:
-        seed_inlier_global = seed_indices
 
     expanded_indices, cc_stats = _extract_connected_component(
         points,
@@ -1541,8 +1646,10 @@ def expand_cylinder_from_seed(
     residuals = np.abs(radial_dist - final_radius)
     if residuals.size > 0:
         residual_median, residual_p90, residual_p95 = np.percentile(residuals, [50, 90, 95]).astype(float)
+        residual_mad = float(np.median(np.abs(residuals - residual_median)))
     else:
         residual_median = residual_p90 = residual_p95 = 0.0
+        residual_mad = 0.0
     time_end = perf_counter()
 
     if verbose:
@@ -1588,9 +1695,685 @@ def expand_cylinder_from_seed(
         steps=cc_stats.steps,
         max_frontier_size=cc_stats.max_frontier_size,
         residual_median=float(residual_median),
+        residual_mad=float(residual_mad),
         residual_p90=float(residual_p90),
         residual_p95=float(residual_p95),
     )
+
+
+def _orthonormal_basis_from_axis(axis_dir: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Build an orthonormal basis (u, v) perpendicular to axis_dir."""
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+    if abs(axis_dir[2]) < 0.9:
+        u = np.cross(axis_dir, np.array([0.0, 0.0, 1.0]))
+    else:
+        u = np.cross(axis_dir, np.array([1.0, 0.0, 0.0]))
+    u = u / np.maximum(np.linalg.norm(u), 1e-8)
+    v = np.cross(axis_dir, u)
+    v = v / np.maximum(np.linalg.norm(v), 1e-8)
+    return u, v
+
+
+def _circle_from_3pts(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+    """Compute circle center/radius from 3 points in 2D."""
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    d = 2.0 * (p0[0] * (p1[1] - p2[1]) + p1[0] * (p2[1] - p0[1]) + p2[0] * (p0[1] - p1[1]))
+    if abs(d) < 1e-12:
+        return None
+    p0_sq = p0[0] * p0[0] + p0[1] * p0[1]
+    p1_sq = p1[0] * p1[0] + p1[1] * p1[1]
+    p2_sq = p2[0] * p2[0] + p2[1] * p2[1]
+    ux = (p0_sq * (p1[1] - p2[1]) + p1_sq * (p2[1] - p0[1]) + p2_sq * (p0[1] - p1[1])) / d
+    uy = (p0_sq * (p2[0] - p1[0]) + p1_sq * (p0[0] - p2[0]) + p2_sq * (p1[0] - p0[0])) / d
+    center = np.array([ux, uy], dtype=float)
+    radius = float(np.linalg.norm(center - p0))
+    if not np.isfinite(radius) or radius <= 0:
+        return None
+    return center, radius
+
+
+def _fit_circle_2d_least_squares(points_2d: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+    """Least-squares circle fit in 2D."""
+    pts = np.asarray(points_2d, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        return None
+    cx, cy, c = sol
+    r_sq = c + cx * cx + cy * cy
+    if not np.isfinite(r_sq) or r_sq <= 0:
+        return None
+    center = np.array([cx, cy], dtype=float)
+    radius = float(np.sqrt(r_sq))
+    return center, radius
+
+
+def _fit_circle_2d_ransac(
+    points_2d: np.ndarray,
+    *,
+    num_iterations: int = 200,
+    inlier_threshold: float = 0.01,
+    min_inliers: int = 6,
+) -> Optional[Tuple[np.ndarray, float, np.ndarray]]:
+    """RANSAC circle fit with least-squares refinement."""
+    pts = np.asarray(points_2d, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+        return None
+    n = len(pts)
+    rng = np.random.default_rng()
+
+    best_inliers: Optional[np.ndarray] = None
+    best_count = 0
+    best_median = float("inf")
+    best_center = None
+    best_radius = None
+
+    for _ in range(max(1, int(num_iterations))):
+        sample = rng.choice(n, size=3, replace=False)
+        circle = _circle_from_3pts(pts[sample[0]], pts[sample[1]], pts[sample[2]])
+        if circle is None:
+            continue
+        center, radius = circle
+        residuals = np.abs(np.linalg.norm(pts - center, axis=1) - radius)
+        inliers = residuals < float(inlier_threshold)
+        count = int(np.count_nonzero(inliers))
+        median_res = float(np.median(residuals)) if residuals.size > 0 else float("inf")
+        if count > best_count or (count == best_count and median_res < best_median):
+            best_inliers = inliers
+            best_count = count
+            best_median = median_res
+            best_center = center
+            best_radius = radius
+
+    if best_inliers is None:
+        ls = _fit_circle_2d_least_squares(pts)
+        if ls is None:
+            return None
+        center, radius = ls
+        inliers = np.ones((n,), dtype=bool)
+        return center, radius, inliers
+
+    if best_count >= min_inliers:
+        ls = _fit_circle_2d_least_squares(pts[best_inliers])
+        if ls is not None:
+            best_center, best_radius = ls
+
+    return best_center, float(best_radius), best_inliers
+
+
+def _estimate_cylinder_from_points(
+    points: np.ndarray,
+    *,
+    axis_dir: Optional[np.ndarray] = None,
+    circle_ransac_iters: int = 200,
+    circle_inlier_threshold: float = 0.01,
+    length_margin: float = 0.05,
+) -> Optional[CylinderParam]:
+    """Estimate cylinder parameters from points given an axis direction."""
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 6:
+        return None
+
+    if axis_dir is None:
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        axis_dir = vh[0]
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    axis_norm = np.linalg.norm(axis_dir)
+    if not np.isfinite(axis_norm) or axis_norm < 1e-12:
+        return None
+    axis_dir = axis_dir / axis_norm
+    axis_dir = _orient_direction(axis_dir, prefer_positive_z=False)
+
+    projections = pts @ axis_dir
+    plane_points = pts - np.outer(projections, axis_dir)
+    origin = plane_points.mean(axis=0)
+    u, v = _orthonormal_basis_from_axis(axis_dir)
+    coords = np.column_stack([(plane_points - origin) @ u, (plane_points - origin) @ v])
+
+    circle_fit = _fit_circle_2d_ransac(
+        coords,
+        num_iterations=circle_ransac_iters,
+        inlier_threshold=circle_inlier_threshold,
+        min_inliers=6,
+    )
+    if circle_fit is None:
+        return None
+
+    center_2d, radius, inliers = circle_fit
+    axis_point = origin + center_2d[0] * u + center_2d[1] * v
+
+    t = (pts - axis_point) @ axis_dir
+    t_min = float(np.min(t))
+    t_max = float(np.max(t))
+    raw_length = max(0.0, t_max - t_min)
+    margin = max(float(length_margin), raw_length * 0.05)
+    length = float(raw_length + 2.0 * margin)
+    center_shift = 0.5 * (t_min + t_max)
+    axis_point = axis_point + axis_dir * center_shift
+
+    residuals = np.abs(np.linalg.norm(pts - axis_point - np.outer((pts - axis_point) @ axis_dir, axis_dir), axis=1) - radius)
+    inlier_mask = residuals < float(circle_inlier_threshold)
+    inlier_indices = np.where(inlier_mask)[0] if inliers is None else np.where(inlier_mask)[0]
+
+    return CylinderParam(
+        axis_point=axis_point,
+        axis_direction=axis_dir,
+        radius=float(radius),
+        length=length,
+        inlier_count=int(len(inlier_indices)),
+        inlier_indices=inlier_indices,
+    )
+
+
+def adaptive_seed_indices(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    *,
+    seed_radius_start: float,
+    seed_radius_max: float,
+    seed_radius_step: float,
+    min_seed_points: int,
+) -> Tuple[np.ndarray, float]:
+    """Collect seed indices by expanding radius until min_seed_points or max."""
+    pts = np.asarray(points, dtype=float)
+    seed_center = np.asarray(seed_center, dtype=float).reshape(-1)
+    if seed_center.size != 3:
+        return np.empty((0,), dtype=int), 0.0
+    radius = float(seed_radius_start)
+    radius_max = float(seed_radius_max)
+    step = max(float(seed_radius_step), 1e-6)
+    min_points = max(int(min_seed_points), 1)
+
+    best_indices = np.empty((0,), dtype=int)
+    while radius <= radius_max + 1e-9:
+        diff = pts - seed_center
+        dist2 = np.einsum("ij,ij->i", diff, diff)
+        mask = dist2 <= radius * radius
+        indices = np.where(mask)[0]
+        best_indices = indices
+        if len(indices) >= min_points:
+            break
+        radius += step
+
+    return best_indices, float(min(radius, radius_max))
+
+
+def compute_cylinder_proxy_from_seed(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    *,
+    seed_radius_start: float = 0.05,
+    seed_radius_max: float = 0.5,
+    seed_radius_step: float = 0.05,
+    min_seed_points: int = 80,
+    circle_ransac_iters: int = 200,
+    circle_inlier_threshold: float = 0.01,
+    length_margin: float = 0.05,
+) -> CylinderProxyInit:
+    """Estimate a proxy cylinder from an adaptive seed region."""
+    seed_indices, seed_radius = adaptive_seed_indices(
+        points,
+        seed_center,
+        seed_radius_start=seed_radius_start,
+        seed_radius_max=seed_radius_max,
+        seed_radius_step=seed_radius_step,
+        min_seed_points=min_seed_points,
+    )
+    if seed_indices.size < 6:
+        return CylinderProxyInit(
+            cylinder=None,
+            seed_indices=seed_indices,
+            seed_radius=seed_radius,
+            axis_dir_pca=None,
+            seed_point_count=int(seed_indices.size),
+            success=False,
+            message=f"Too few seed points: {len(seed_indices)}",
+        )
+
+    seed_points = np.asarray(points, dtype=float)[seed_indices]
+    centroid = seed_points.mean(axis=0)
+    centered = seed_points - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axis_dir_pca = _orient_direction(vh[0], prefer_positive_z=False)
+
+    cylinder = _estimate_cylinder_from_points(
+        seed_points,
+        axis_dir=axis_dir_pca,
+        circle_ransac_iters=circle_ransac_iters,
+        circle_inlier_threshold=circle_inlier_threshold,
+        length_margin=length_margin,
+    )
+    if cylinder is None:
+        return CylinderProxyInit(
+            cylinder=None,
+            seed_indices=seed_indices,
+            seed_radius=seed_radius,
+            axis_dir_pca=axis_dir_pca,
+            seed_point_count=int(seed_indices.size),
+            success=False,
+            message="Failed to fit proxy cylinder from seed points",
+        )
+
+    return CylinderProxyInit(
+        cylinder=cylinder,
+        seed_indices=seed_indices,
+        seed_radius=seed_radius,
+        axis_dir_pca=axis_dir_pca,
+        seed_point_count=int(seed_indices.size),
+        success=True,
+        message="Proxy cylinder initialized",
+    )
+
+
+def extract_cylinder_surface_component(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    seed_indices: np.ndarray,
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    radius: float,
+    length: float,
+    *,
+    surface_threshold: float,
+    cap_margin: float,
+    grow_radius: float,
+    max_expand_radius: float,
+    max_expanded_points: int,
+    max_frontier: int,
+    max_steps: int,
+) -> CylinderSurfaceExtractResult:
+    """Extract a connected set of points on a cylinder surface."""
+    pts = np.asarray(points, dtype=float)
+    axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    seed_indices = np.asarray(seed_indices, dtype=int).reshape(-1)
+    if axis_point.size != 3 or axis_dir.size != 3:
+        return CylinderSurfaceExtractResult(
+            inlier_indices=np.empty((0,), dtype=int),
+            candidate_count=0,
+            seed_inlier_count=0,
+            stopped_early=False,
+            stop_reason="invalid_axis",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message="Invalid axis for cylinder extraction",
+        )
+
+    axis_norm = np.linalg.norm(axis_dir)
+    if not np.isfinite(axis_norm) or axis_norm < 1e-12:
+        return CylinderSurfaceExtractResult(
+            inlier_indices=np.empty((0,), dtype=int),
+            candidate_count=0,
+            seed_inlier_count=0,
+            stopped_early=False,
+            stop_reason="invalid_axis",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message="Invalid axis direction for cylinder extraction",
+        )
+    axis_dir = axis_dir / axis_norm
+
+    max_expand_radius = float(max_expand_radius)
+    if max_expand_radius > 0:
+        delta = pts - np.asarray(seed_center, dtype=float).reshape(-1)
+        dist2 = np.einsum("ij,ij->i", delta, delta)
+        expand_mask = dist2 <= max_expand_radius * max_expand_radius
+        expand_indices = np.where(expand_mask)[0]
+    else:
+        expand_indices = np.arange(len(pts), dtype=int)
+
+    if expand_indices.size == 0:
+        return CylinderSurfaceExtractResult(
+            inlier_indices=np.empty((0,), dtype=int),
+            candidate_count=0,
+            seed_inlier_count=0,
+            stopped_early=False,
+            stop_reason="no_expand_points",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message="No points within max_expand_radius",
+        )
+
+    expand_points = pts[expand_indices]
+    diff = expand_points - axis_point
+    t = diff @ axis_dir
+    radial_vec = diff - np.outer(t, axis_dir)
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+    half_len = 0.5 * float(length)
+    cap_margin = float(cap_margin)
+
+    candidate_mask = (
+        np.abs(radial_dist - float(radius)) < float(surface_threshold)
+    ) & (
+        t >= -half_len - cap_margin
+    ) & (
+        t <= half_len + cap_margin
+    )
+    candidate_local = np.where(candidate_mask)[0]
+    candidate_indices = expand_indices[candidate_local]
+
+    if candidate_indices.size == 0:
+        return CylinderSurfaceExtractResult(
+            inlier_indices=np.empty((0,), dtype=int),
+            candidate_count=0,
+            seed_inlier_count=0,
+            stopped_early=False,
+            stop_reason="no_candidates",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message="No candidate points on cylinder surface",
+        )
+
+    seed_inlier_indices = np.empty((0,), dtype=int)
+    if seed_indices.size > 0:
+        seed_points = pts[seed_indices]
+        diff_seed = seed_points - axis_point
+        t_seed = diff_seed @ axis_dir
+        radial_seed = diff_seed - np.outer(t_seed, axis_dir)
+        radial_seed_dist = np.linalg.norm(radial_seed, axis=1)
+        seed_mask = (
+            np.abs(radial_seed_dist - float(radius)) < float(surface_threshold)
+        ) & (
+            t_seed >= -half_len - cap_margin
+        ) & (
+            t_seed <= half_len + cap_margin
+        )
+        seed_inlier_indices = seed_indices[np.where(seed_mask)[0]]
+
+    if seed_inlier_indices.size == 0:
+        candidate_points = pts[candidate_indices]
+        delta = candidate_points - np.asarray(seed_center, dtype=float).reshape(-1)
+        dist2 = np.einsum("ij,ij->i", delta, delta)
+        nearest = int(np.argmin(dist2))
+        seed_inlier_indices = np.array([candidate_indices[nearest]], dtype=int)
+
+    component, cc_stats = _extract_connected_component(
+        pts,
+        candidate_indices,
+        seed_inlier_indices,
+        grow_radius,
+        max_expanded_points=max_expanded_points,
+        max_frontier=max_frontier,
+        max_steps=max_steps,
+        enforce_seed_in_component=True,
+    )
+
+    return CylinderSurfaceExtractResult(
+        inlier_indices=component,
+        candidate_count=int(candidate_indices.size),
+        seed_inlier_count=int(seed_inlier_indices.size),
+        stopped_early=bool(cc_stats.stopped_early),
+        stop_reason=str(cc_stats.stop_reason),
+        steps=int(cc_stats.steps),
+        max_frontier_size=int(cc_stats.max_frontier_size),
+        success=True,
+        message="Cylinder surface extraction OK",
+    )
+
+
+def _compute_cylinder_residual_stats(
+    points: np.ndarray,
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    radius: float,
+) -> Tuple[float, float]:
+    pts = np.asarray(points, dtype=float)
+    diff = pts - np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+    t = diff @ axis_dir
+    radial_vec = diff - np.outer(t, axis_dir)
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+    residuals = np.abs(radial_dist - float(radius))
+    if residuals.size == 0:
+        return 0.0, 0.0
+    median = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - median)))
+    return median, mad
+
+
+def finalize_cylinder_from_proxy(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    seed_indices: np.ndarray,
+    proxy: CylinderParam,
+    *,
+    surface_threshold: float,
+    cap_margin: float,
+    grow_radius: float,
+    max_expand_radius: float,
+    max_expanded_points: int,
+    max_frontier: int,
+    max_steps: int,
+    refine_iters: int = 2,
+    circle_ransac_iters: int = 200,
+    circle_inlier_threshold: float = 0.01,
+    allow_length_growth: bool = False,
+) -> CylinderProbeResult:
+    """Use a proxy cylinder to extract points and refit a final cylinder."""
+    if proxy is None:
+        return CylinderProbeResult(
+            proxy=None,
+            final=None,
+            inlier_indices=None,
+            inlier_count=0,
+            residual_median=0.0,
+            residual_mad=0.0,
+            candidate_count=0,
+            stopped_early=False,
+            stop_reason="no_proxy",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message="Proxy cylinder is missing",
+        )
+
+    axis_point = np.asarray(proxy.axis_point, dtype=float)
+    axis_dir = np.asarray(proxy.axis_direction, dtype=float)
+    radius = float(proxy.radius)
+    length = float(proxy.length)
+
+    length_for_extract = length
+    if allow_length_growth and max_expand_radius > 0:
+        length_for_extract = max(length_for_extract, float(max_expand_radius) * 2.0)
+
+    extract = extract_cylinder_surface_component(
+        points,
+        seed_center,
+        seed_indices,
+        axis_point,
+        axis_dir,
+        radius,
+        length_for_extract,
+        surface_threshold=surface_threshold,
+        cap_margin=cap_margin,
+        grow_radius=grow_radius,
+        max_expand_radius=max_expand_radius,
+        max_expanded_points=max_expanded_points,
+        max_frontier=max_frontier,
+        max_steps=max_steps,
+    )
+    if not extract.success or extract.inlier_indices.size < 6:
+        return CylinderProbeResult(
+            proxy=proxy,
+            final=None,
+            inlier_indices=extract.inlier_indices if extract.success else None,
+            inlier_count=int(extract.inlier_indices.size) if extract.success else 0,
+            residual_median=0.0,
+            residual_mad=0.0,
+            candidate_count=int(extract.candidate_count),
+            stopped_early=bool(extract.stopped_early),
+            stop_reason=str(extract.stop_reason),
+            steps=int(extract.steps),
+            max_frontier_size=int(extract.max_frontier_size),
+            success=False,
+            message="Too few inliers for final cylinder",
+        )
+
+    inlier_indices = extract.inlier_indices
+    last_extract = extract
+    axis_dir_ref = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+
+    refine_iters = max(1, min(int(refine_iters), 3))
+    for _ in range(refine_iters):
+        inlier_points = np.asarray(points, dtype=float)[inlier_indices]
+        cyl = _estimate_cylinder_from_points(
+            inlier_points,
+            axis_dir=axis_dir_ref,
+            circle_ransac_iters=circle_ransac_iters,
+            circle_inlier_threshold=circle_inlier_threshold,
+        )
+        if cyl is None:
+            break
+        if np.dot(cyl.axis_direction, axis_dir_ref) < 0:
+            cyl.axis_direction = -cyl.axis_direction
+        axis_dir_ref = cyl.axis_direction
+        axis_point = cyl.axis_point
+        radius = float(cyl.radius)
+        length = float(cyl.length)
+
+        length_for_extract = length
+        if allow_length_growth and max_expand_radius > 0:
+            length_for_extract = max(length_for_extract, float(max_expand_radius) * 2.0)
+
+        last_extract = extract_cylinder_surface_component(
+            points,
+            seed_center,
+            seed_indices,
+            axis_point,
+            axis_dir_ref,
+            radius,
+            length_for_extract,
+            surface_threshold=surface_threshold,
+            cap_margin=cap_margin,
+            grow_radius=grow_radius,
+            max_expand_radius=max_expand_radius,
+            max_expanded_points=max_expanded_points,
+            max_frontier=max_frontier,
+            max_steps=max_steps,
+        )
+        if not last_extract.success or last_extract.inlier_indices.size < 6:
+            break
+        inlier_indices = last_extract.inlier_indices
+
+    final_cylinder = CylinderParam(
+        axis_point=axis_point,
+        axis_direction=axis_dir_ref,
+        radius=radius,
+        length=length,
+        inlier_count=int(inlier_indices.size),
+        inlier_indices=inlier_indices,
+    )
+    residual_median, residual_mad = _compute_cylinder_residual_stats(
+        np.asarray(points, dtype=float)[inlier_indices],
+        axis_point,
+        axis_dir_ref,
+        radius,
+    )
+
+    return CylinderProbeResult(
+        proxy=proxy,
+        final=final_cylinder,
+        inlier_indices=inlier_indices,
+        inlier_count=int(inlier_indices.size),
+        residual_median=float(residual_median),
+        residual_mad=float(residual_mad),
+        candidate_count=int(last_extract.candidate_count),
+        stopped_early=bool(last_extract.stopped_early),
+        stop_reason=str(last_extract.stop_reason),
+        steps=int(last_extract.steps),
+        max_frontier_size=int(last_extract.max_frontier_size),
+        success=True,
+        message="Cylinder probe fit successful",
+    )
+
+
+def probe_cylinder_from_seed(
+    points: np.ndarray,
+    seed_center: np.ndarray,
+    *,
+    seed_radius_start: float = 0.05,
+    seed_radius_max: float = 0.5,
+    seed_radius_step: float = 0.05,
+    min_seed_points: int = 80,
+    circle_ransac_iters: int = 200,
+    circle_inlier_threshold: float = 0.01,
+    length_margin: float = 0.05,
+    surface_threshold: float = 0.02,
+    cap_margin: float = 0.05,
+    grow_radius: float = 0.15,
+    max_expand_radius: float = 5.0,
+    max_expanded_points: int = 200_000,
+    max_frontier: int = 200_000,
+    max_steps: int = 1_000_000,
+    refine_iters: int = 2,
+) -> CylinderProbeResult:
+    """Full probe pipeline from seed click to final cylinder fit."""
+    proxy_init = compute_cylinder_proxy_from_seed(
+        points,
+        seed_center,
+        seed_radius_start=seed_radius_start,
+        seed_radius_max=seed_radius_max,
+        seed_radius_step=seed_radius_step,
+        min_seed_points=min_seed_points,
+        circle_ransac_iters=circle_ransac_iters,
+        circle_inlier_threshold=circle_inlier_threshold,
+        length_margin=length_margin,
+    )
+    if not proxy_init.success or proxy_init.cylinder is None:
+        return CylinderProbeResult(
+            proxy=None,
+            final=None,
+            inlier_indices=None,
+            inlier_count=0,
+            residual_median=0.0,
+            residual_mad=0.0,
+            candidate_count=0,
+            stopped_early=False,
+            stop_reason="proxy_init_failed",
+            steps=0,
+            max_frontier_size=0,
+            success=False,
+            message=proxy_init.message,
+            seed_radius=float(proxy_init.seed_radius),
+            seed_point_count=int(proxy_init.seed_point_count),
+        )
+
+    result = finalize_cylinder_from_proxy(
+        points,
+        seed_center,
+        proxy_init.seed_indices,
+        proxy_init.cylinder,
+        surface_threshold=surface_threshold,
+        cap_margin=cap_margin,
+        grow_radius=grow_radius,
+        max_expand_radius=max_expand_radius,
+        max_expanded_points=max_expanded_points,
+        max_frontier=max_frontier,
+        max_steps=max_steps,
+        refine_iters=refine_iters,
+        circle_ransac_iters=circle_ransac_iters,
+        circle_inlier_threshold=circle_inlier_threshold,
+        allow_length_growth=True,
+    )
+    result.seed_radius = float(proxy_init.seed_radius)
+    result.seed_point_count = int(proxy_init.seed_point_count)
+    return result
 
 
 def extract_stair_planes(

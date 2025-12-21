@@ -244,7 +244,7 @@ python main.py -i scan.pcd --seed-expand \
 1. 点群を表示 → ビューワを閉じる
 2. Shift+クリックで seed 中心点を選択
 3. プリミティブタイプ（p:平面 / c:円柱）を選択
-4. seed-radius 内の点から初期モデルをフィット
+4. seed-radius 内の点から初期モデルをフィット（円柱は `--cylinder-init-*` 指定で初期円柱を使用可）
 5. max-expand-radius 内で連結な同一構造点を拡張抽出
 6. 結果を可視化し、JSON と PLY（オプション）に保存
 
@@ -261,6 +261,20 @@ python main.py -i scan.pcd --seed-expand \
 | `--normal-th` | 法線条件の角度閾値（度）。法線が無い場合はスキップ | 30.0 |
 | `--seed-output` | 結果出力先 JSON ファイル | seed_expand_results.json |
 | `--export-inliers` | 拡張点群の PLY 出力先（デバッグ用） | - |
+| `--cylinder-init-axis-point` | 初期円柱の軸上点 (x y z) | - |
+| `--cylinder-init-axis-dir` | 初期円柱の軸方向 (x y z) | - |
+| `--cylinder-init-radius` | 初期円柱の半径 (m) | - |
+| `--cylinder-init-length` | 初期円柱の長さ (m)。拡張失敗時の表示用 | - |
+
+### 円柱の初期形状を指定（CAD 的な置き方）
+
+```bash
+python main.py -i scan.pcd --seed-expand \
+    --cylinder-init-axis-point 0.0 0.0 0.0 \
+    --cylinder-init-axis-dir 0.0 0.0 1.0 \
+    --cylinder-init-radius 0.10 \
+    --cylinder-init-length 2.0
+```
 
 ### 拡張アルゴリズム
 
@@ -315,6 +329,35 @@ python main.py -i scan.pcd --seed-expand \
 - **緑パッチ**: フィットされた平面メッシュ
 - **青シリンダー**: フィットされた円柱メッシュ
 - **黄色球**: seed 中心点
+
+## Interactive Cylinder Probe（円柱プローブ）
+
+円柱表面を1回クリックし、プロキシ円柱をキーで微調整して確定するモードです。
+
+### 使い方
+
+```bash
+python main.py -i scan.ply --cyl-probe --show-context
+```
+
+確定後は `cyl_probe_results.json` に保存されます。`--export-mesh out.ply` で最終円柱メッシュも書き出せます。
+
+### 操作キー
+
+- `[` / `]` : 半径 - / +
+- `-` / `=` : 長さ - / +
+- `W` / `A` / `S` / `D` : 軸に垂直な平面内で移動
+- `R` / `F` : 軸方向に移動
+- `矢印キー` : 軸方向の回転（pitch/yaw）
+- `X` : PCA推定軸にリセット
+- `V` : 軸を世界Zへスナップ ON/OFF
+- `Enter` : 確定して再フィット
+- `Esc` : キャンセル
+
+### 出力（JSON）
+
+`proxy`（確定時のプロキシ）と `final`（再フィット後）を保存します。
+半径/直径、端点、残差統計、操作回数なども含まれます。
 
 ## Notes
 
