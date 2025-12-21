@@ -209,7 +209,7 @@ def fit_cylinder(
     projections = projections[final_inliers]
     radial_distances = radial_distances[final_inliers]
 
-    length = float(np.max(projections) - np.min(projections)) if len(projections) > 0 else 0.0
+    length, _ = _robust_length_from_projections(projections, quantile=0.02)
     radius = float(np.median(radial_distances)) if len(radial_distances) > 0 else float(radius)
 
     return CylinderParam(
@@ -1730,6 +1730,27 @@ def _orthonormal_basis_from_axis(axis_dir: np.ndarray) -> Tuple[np.ndarray, np.n
     return u, v
 
 
+def _robust_length_from_projections(
+    projections: np.ndarray,
+    *,
+    quantile: float = 0.02,
+) -> Tuple[float, float]:
+    """Compute length and center shift from projections with trimming."""
+    proj = np.asarray(projections, dtype=float).reshape(-1)
+    if proj.size == 0:
+        return 0.0, 0.0
+    q = float(np.clip(quantile, 0.0, 0.49))
+    if q > 0.0 and proj.size >= 4:
+        lo = float(np.quantile(proj, q))
+        hi = float(np.quantile(proj, 1.0 - q))
+    else:
+        lo = float(np.min(proj))
+        hi = float(np.max(proj))
+    length = max(0.0, hi - lo)
+    center_shift = 0.5 * (lo + hi)
+    return length, center_shift
+
+
 def _circle_from_3pts(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
     """Compute circle center/radius from 3 points in 2D."""
     p0 = np.asarray(p0, dtype=float)
@@ -1832,6 +1853,7 @@ def _estimate_cylinder_from_points(
     circle_ransac_iters: int = 200,
     circle_inlier_threshold: float = 0.01,
     length_margin: float = 0.05,
+    length_quantile: float = 0.02,
 ) -> Optional[CylinderParam]:
     """Estimate cylinder parameters from points given an axis direction."""
     pts = np.asarray(points, dtype=float)
@@ -1869,12 +1891,16 @@ def _estimate_cylinder_from_points(
     axis_point = origin + center_2d[0] * u + center_2d[1] * v
 
     t = (pts - axis_point) @ axis_dir
-    t_min = float(np.min(t))
-    t_max = float(np.max(t))
-    raw_length = max(0.0, t_max - t_min)
+    if inliers is not None and len(inliers) == len(t):
+        t_used = t[inliers]
+    else:
+        t_used = t
+    raw_length, center_shift = _robust_length_from_projections(
+        t_used,
+        quantile=length_quantile,
+    )
     margin = max(float(length_margin), raw_length * 0.05)
     length = float(raw_length + 2.0 * margin)
-    center_shift = 0.5 * (t_min + t_max)
     axis_point = axis_point + axis_dir * center_shift
 
     residuals = np.abs(np.linalg.norm(pts - axis_point - np.outer((pts - axis_point) @ axis_dir, axis_dir), axis=1) - radius)
@@ -2060,6 +2086,8 @@ def extract_cylinder_surface_component(
     max_expanded_points: int,
     max_frontier: int,
     max_steps: int,
+    normals: Optional[np.ndarray] = None,
+    normal_angle_threshold_deg: float = 30.0,
 ) -> CylinderSurfaceExtractResult:
     """Extract a connected set of points on a cylinder surface."""
     pts = np.asarray(points, dtype=float)
@@ -2131,6 +2159,15 @@ def extract_cylinder_surface_component(
     ) & (
         t <= half_len + cap_margin
     )
+    if normals is not None and np.asarray(normals).shape == pts.shape:
+        expand_normals = np.asarray(normals, dtype=float)[expand_indices]
+        expand_normals = expand_normals / np.maximum(
+            np.linalg.norm(expand_normals, axis=1, keepdims=True), 1e-8
+        )
+        radial_dir = radial_vec / np.maximum(radial_dist[:, None], 1e-8)
+        normal_cos_threshold = np.cos(np.deg2rad(float(normal_angle_threshold_deg)))
+        alignment = np.abs(np.einsum("ij,ij->i", radial_dir, expand_normals))
+        candidate_mask &= alignment > normal_cos_threshold
     candidate_local = np.where(candidate_mask)[0]
     candidate_indices = expand_indices[candidate_local]
 
@@ -2295,6 +2332,8 @@ def finalize_cylinder_from_proxy(
     max_expanded_points: int,
     max_frontier: int,
     max_steps: int,
+    normals: Optional[np.ndarray] = None,
+    normal_angle_threshold_deg: float = 30.0,
     refine_iters: int = 2,
     circle_ransac_iters: int = 200,
     circle_inlier_threshold: float = 0.01,
@@ -2343,6 +2382,8 @@ def finalize_cylinder_from_proxy(
         max_expanded_points=max_expanded_points,
         max_frontier=max_frontier,
         max_steps=max_steps,
+        normals=normals,
+        normal_angle_threshold_deg=normal_angle_threshold_deg,
     )
     if not extract.success or extract.inlier_indices.size < 6:
         return CylinderProbeResult(
@@ -2403,6 +2444,8 @@ def finalize_cylinder_from_proxy(
             max_expanded_points=max_expanded_points,
             max_frontier=max_frontier,
             max_steps=max_steps,
+            normals=normals,
+            normal_angle_threshold_deg=normal_angle_threshold_deg,
         )
         if not last_extract.success or last_extract.inlier_indices.size < 6:
             break
@@ -2443,6 +2486,7 @@ def finalize_cylinder_from_proxy(
 def probe_cylinder_from_seed(
     points: np.ndarray,
     seed_center: np.ndarray,
+    normals: Optional[np.ndarray] = None,
     *,
     seed_radius_start: float = 0.05,
     seed_radius_max: float = 0.5,
@@ -2464,6 +2508,7 @@ def probe_cylinder_from_seed(
     proxy_init = compute_cylinder_proxy_from_seed(
         points,
         seed_center,
+        normals=normals,
         seed_radius_start=seed_radius_start,
         seed_radius_max=seed_radius_max,
         seed_radius_step=seed_radius_step,
@@ -2503,6 +2548,8 @@ def probe_cylinder_from_seed(
         max_expanded_points=max_expanded_points,
         max_frontier=max_frontier,
         max_steps=max_steps,
+        normals=normals,
+        normal_angle_threshold_deg=30.0,
         refine_iters=refine_iters,
         circle_ransac_iters=circle_ransac_iters,
         circle_inlier_threshold=circle_inlier_threshold,
