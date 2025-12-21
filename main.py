@@ -2461,6 +2461,8 @@ def run_session_mode(
             center=None,
             radius=context_radius,
         )
+        if context_pcd is not None:
+            context_pcd = colorize_point_cloud_by_height(context_pcd)
 
     rng = np.random.default_rng(1234)
 
@@ -2589,6 +2591,7 @@ def run_session_mode(
             proxy_init = compute_cylinder_proxy_from_seed(
                 all_points,
                 seed_center,
+                normals=all_normals,
                 seed_radius_start=args.seed_radius_start,
                 seed_radius_max=args.seed_radius_max,
                 seed_radius_step=args.seed_radius_step,
@@ -3237,6 +3240,7 @@ def run_cylinder_probe_mode(
     proxy_init = compute_cylinder_proxy_from_seed(
         all_points,
         seed_center,
+        normals=all_normals,
         seed_radius_start=args.cyl_probe_seed_start,
         seed_radius_max=args.cyl_probe_seed_max,
         seed_radius_step=args.cyl_probe_seed_step,

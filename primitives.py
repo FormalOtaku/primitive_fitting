@@ -1938,6 +1938,7 @@ def adaptive_seed_indices(
 def compute_cylinder_proxy_from_seed(
     points: np.ndarray,
     seed_center: np.ndarray,
+    normals: Optional[np.ndarray] = None,
     *,
     seed_radius_start: float = 0.05,
     seed_radius_max: float = 0.5,
@@ -1973,13 +1974,54 @@ def compute_cylinder_proxy_from_seed(
     _, _, vh = np.linalg.svd(centered, full_matrices=False)
     axis_dir_pca = _orient_direction(vh[0], prefer_positive_z=False)
 
-    cylinder = _estimate_cylinder_from_points(
-        seed_points,
-        axis_dir=axis_dir_pca,
-        circle_ransac_iters=circle_ransac_iters,
-        circle_inlier_threshold=circle_inlier_threshold,
-        length_margin=length_margin,
-    )
+    axis_candidates = [axis_dir_pca, _orient_direction(vh[1], prefer_positive_z=False)]
+
+    if normals is not None:
+        normals = np.asarray(normals, dtype=float)
+        if normals.shape == points.shape:
+            seed_normals = normals[seed_indices]
+            seed_normals = seed_normals[np.all(np.isfinite(seed_normals), axis=1)]
+            if len(seed_normals) >= 6:
+                seed_normals = seed_normals / np.maximum(
+                    np.linalg.norm(seed_normals, axis=1, keepdims=True), 1e-8
+                )
+                cov = seed_normals.T @ seed_normals
+                try:
+                    _, _, vh_norm = np.linalg.svd(cov, full_matrices=False)
+                    axis_from_normals = _orient_direction(vh_norm[-1], prefer_positive_z=False)
+                    axis_candidates.append(axis_from_normals)
+                except Exception:
+                    pass
+
+    best_cylinder = None
+    best_score = -1.0
+    best_radius = 0.0
+    eps = 1e-6
+    for axis_dir in axis_candidates:
+        cylinder = _estimate_cylinder_from_points(
+            seed_points,
+            axis_dir=axis_dir,
+            circle_ransac_iters=circle_ransac_iters,
+            circle_inlier_threshold=circle_inlier_threshold,
+            length_margin=length_margin,
+        )
+        if cylinder is None:
+            continue
+        res_median, _ = _compute_cylinder_residual_stats(
+            seed_points,
+            cylinder.axis_point,
+            cylinder.axis_direction,
+            cylinder.radius,
+        )
+        score = float(cylinder.inlier_count) / max(float(res_median), eps)
+        if cylinder.radius < float(circle_inlier_threshold) * 2.0:
+            score *= 0.5
+        if score > best_score or (abs(score - best_score) < 1e-6 and cylinder.radius > best_radius):
+            best_score = score
+            best_radius = float(cylinder.radius)
+            best_cylinder = cylinder
+
+    cylinder = best_cylinder
     if cylinder is None:
         return CylinderProxyInit(
             cylinder=None,
@@ -2257,6 +2299,7 @@ def finalize_cylinder_from_proxy(
     circle_ransac_iters: int = 200,
     circle_inlier_threshold: float = 0.01,
     allow_length_growth: bool = False,
+    allow_axis_refit: bool = True,
 ) -> CylinderProbeResult:
     """Use a proxy cylinder to extract points and refit a final cylinder."""
     if proxy is None:
@@ -2325,9 +2368,10 @@ def finalize_cylinder_from_proxy(
     refine_iters = max(1, min(int(refine_iters), 3))
     for _ in range(refine_iters):
         inlier_points = np.asarray(points, dtype=float)[inlier_indices]
+        axis_dir_input = None if allow_axis_refit else axis_dir_ref
         cyl = _estimate_cylinder_from_points(
             inlier_points,
-            axis_dir=axis_dir_ref,
+            axis_dir=axis_dir_input,
             circle_ransac_iters=circle_ransac_iters,
             circle_inlier_threshold=circle_inlier_threshold,
         )
