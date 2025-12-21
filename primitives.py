@@ -1734,20 +1734,29 @@ def _robust_length_from_projections(
     projections: np.ndarray,
     *,
     quantile: float = 0.02,
+    min_fraction: float = 0.6,
 ) -> Tuple[float, float]:
     """Compute length and center shift from projections with trimming."""
     proj = np.asarray(projections, dtype=float).reshape(-1)
     if proj.size == 0:
         return 0.0, 0.0
+    raw_lo = float(np.min(proj))
+    raw_hi = float(np.max(proj))
+    raw_length = max(0.0, raw_hi - raw_lo)
     q = float(np.clip(quantile, 0.0, 0.49))
     if q > 0.0 and proj.size >= 4:
         lo = float(np.quantile(proj, q))
         hi = float(np.quantile(proj, 1.0 - q))
     else:
-        lo = float(np.min(proj))
-        hi = float(np.max(proj))
+        lo = raw_lo
+        hi = raw_hi
     length = max(0.0, hi - lo)
     center_shift = 0.5 * (lo + hi)
+    if raw_length > 0.0:
+        min_fraction = float(np.clip(min_fraction, 0.0, 1.0))
+        if min_fraction > 0.0 and length < raw_length * min_fraction:
+            length = raw_length
+            center_shift = 0.5 * (raw_lo + raw_hi)
     return length, center_shift
 
 
@@ -2167,7 +2176,12 @@ def extract_cylinder_surface_component(
         radial_dir = radial_vec / np.maximum(radial_dist[:, None], 1e-8)
         normal_cos_threshold = np.cos(np.deg2rad(float(normal_angle_threshold_deg)))
         alignment = np.abs(np.einsum("ij,ij->i", radial_dir, expand_normals))
-        candidate_mask &= alignment > normal_cos_threshold
+        aligned_mask = candidate_mask & (alignment > normal_cos_threshold)
+        base_count = int(np.count_nonzero(candidate_mask))
+        aligned_count = int(np.count_nonzero(aligned_mask))
+        min_keep = max(6, int(base_count * 0.25))
+        if aligned_count >= min_keep:
+            candidate_mask = aligned_mask
     candidate_local = np.where(candidate_mask)[0]
     candidate_indices = expand_indices[candidate_local]
 
