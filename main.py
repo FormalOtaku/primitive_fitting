@@ -1331,6 +1331,12 @@ def parse_args():
         help="Session JSON file to read/write (default: session.json)"
     )
     parser.add_argument(
+        "--session-reset",
+        action="store_true",
+        dest="session_reset",
+        help="Start session from empty (ignore existing session-file)"
+    )
+    parser.add_argument(
         "--export-all",
         type=str,
         default=None,
@@ -1343,6 +1349,19 @@ def parse_args():
         default="auto",
         choices=["auto", "plane", "cylinder"],
         help="Force primitive type in session mode (default: auto)"
+    )
+    parser.add_argument(
+        "--session-dedup",
+        action="store_true",
+        dest="session_dedup",
+        default=True,
+        help="Enable session deduplication (default: on)"
+    )
+    parser.add_argument(
+        "--session-no-dedup",
+        action="store_false",
+        dest="session_dedup",
+        help="Disable session deduplication"
     )
 
     # Preprocessing options (can override profile)
@@ -2430,6 +2449,60 @@ def mesh_from_session_object(obj: dict) -> Optional[o3d.geometry.TriangleMesh]:
     return None
 
 
+def _axis_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    a = unit_vector(a)
+    b = unit_vector(b)
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return float(np.rad2deg(np.arccos(abs(dot))))
+
+
+def _axis_distance(p0: np.ndarray, d0: np.ndarray, p1: np.ndarray, d1: np.ndarray) -> float:
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    d0 = unit_vector(d0)
+    d1 = unit_vector(d1)
+    cross = np.cross(d0, d1)
+    cross_norm = np.linalg.norm(cross)
+    if cross_norm < 1e-8:
+        diff = p1 - p0
+        return float(np.linalg.norm(diff - np.dot(diff, d0) * d0))
+    diff = p1 - p0
+    return float(abs(np.dot(diff, cross)) / cross_norm)
+
+
+def find_duplicate_cylinder(
+    new_obj: dict,
+    objects: list,
+    *,
+    angle_deg: float = 12.0,
+    axis_dist: float = 0.15,
+    radius_rel: float = 0.25,
+    radius_abs: float = 0.03,
+) -> Optional[int]:
+    params = new_obj.get("params", {})
+    axis_point = np.asarray(params.get("axis_point", [0.0, 0.0, 0.0]), dtype=float)
+    axis_dir = np.asarray(params.get("axis_direction", [0.0, 0.0, 1.0]), dtype=float)
+    radius = float(params.get("radius", 0.0))
+
+    for idx, obj in enumerate(objects):
+        if obj.get("type") != "cylinder":
+            continue
+        p = obj.get("params", {})
+        op = np.asarray(p.get("axis_point", [0.0, 0.0, 0.0]), dtype=float)
+        od = np.asarray(p.get("axis_direction", [0.0, 0.0, 1.0]), dtype=float)
+        orad = float(p.get("radius", 0.0))
+        if radius <= 0 or orad <= 0:
+            continue
+        if _axis_angle_deg(axis_dir, od) > angle_deg:
+            continue
+        if _axis_distance(axis_point, axis_dir, op, od) > axis_dist:
+            continue
+        if abs(radius - orad) > max(radius_abs, radius_rel * radius):
+            continue
+        return idx
+    return None
+
+
 def run_session_mode(
     pcd: o3d.geometry.PointCloud,
     args,
@@ -2446,7 +2519,11 @@ def run_session_mode(
     all_points = np.asarray(pcd.points)
     all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
 
-    session = load_session(args.session_file)
+    if args.session_reset:
+        session = {"version": SESSION_RESULT_VERSION, "objects": []}
+        print("Session reset: starting from empty.")
+    else:
+        session = load_session(args.session_file)
     meshes: List[o3d.geometry.TriangleMesh] = []
     for obj in session.get("objects", []):
         mesh = mesh_from_session_object(obj)
@@ -2467,9 +2544,16 @@ def run_session_mode(
 
     rng = np.random.default_rng(1234)
 
+    def _apply_render_options(vis_obj):
+        opt = vis_obj.get_render_option()
+        if opt is not None:
+            opt.point_size = 2.0
+            opt.background_color = np.array([0.03, 0.03, 0.03])
+
     def show_scene_for_pick():
         vis = o3d.visualization.VisualizerWithEditing()
         vis.create_window(window_name="Session Pick (Shift+Click, close to confirm)")
+        _apply_render_options(vis)
         pick_cloud = colorize_point_cloud_by_height(pcd)
         vis.add_geometry(pick_cloud)
         for mesh in meshes:
@@ -2486,14 +2570,18 @@ def run_session_mode(
         return pick_points[idx]
 
     def show_scene():
-        geometries = []
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="Session Workspace")
+        _apply_render_options(vis)
         if context_pcd is not None and not context_pcd.is_empty():
-            geometries.append(context_pcd)
+            vis.add_geometry(context_pcd)
         else:
             base = colorize_point_cloud_by_height(pcd)
-            geometries.append(base)
-        geometries.extend(meshes)
-        o3d.visualization.draw_geometries(geometries, window_name="Session Workspace")
+            vis.add_geometry(base)
+        for mesh in meshes:
+            vis.add_geometry(mesh)
+        vis.run()
+        vis.destroy_window()
 
     while True:
         seed_center = show_scene_for_pick()
@@ -2716,7 +2804,6 @@ def run_session_mode(
                 final.length,
                 color,
             )
-            meshes.append(cyl_mesh)
             obj = {
                 "id": len(session["objects"]),
                 "type": "cylinder",
@@ -2753,7 +2840,25 @@ def run_session_mode(
                     "end_center_0": p0.tolist(),
                     "end_center_1": p1.tolist(),
                 }
-            session["objects"].append(obj)
+            if args.session_dedup:
+                dup_idx = find_duplicate_cylinder(obj, session["objects"])
+            else:
+                dup_idx = None
+
+            if dup_idx is not None:
+                existing = session["objects"][dup_idx]
+                old_score = float(existing.get("quality", {}).get("score", 0.0))
+                new_score = float(obj.get("quality", {}).get("score", 0.0))
+                if new_score >= old_score:
+                    session["objects"][dup_idx] = obj
+                    if dup_idx < len(meshes):
+                        meshes[dup_idx] = cyl_mesh
+                    print("  Updated existing cylinder (dedup).")
+                else:
+                    print("  Skipped duplicate cylinder (existing better).")
+            else:
+                session["objects"].append(obj)
+                meshes.append(cyl_mesh)
         else:
             print("  Unknown selection, skipping.")
             continue
@@ -3206,6 +3311,7 @@ def run_cylinder_probe_mode(
 
     # Get all points
     all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
 
     # Show point cloud first
     print("\n=== Point Cloud Viewer ===")
