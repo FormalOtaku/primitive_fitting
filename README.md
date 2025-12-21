@@ -359,6 +359,40 @@ python main.py -i scan.ply --cyl-probe --show-context
 `proxy`（確定時のプロキシ）と `final`（再フィット後）を保存します。
 半径/直径、端点、残差統計、操作回数なども含まれます。
 
+## Session Mode（ワークスペース型・一発抽出）
+
+複数オブジェクトを「クリック→一発抽出→シーンに保持」を繰り返して、最後にまとめて出力できます。
+
+### 使い方
+
+```bash
+python main.py -i scan.ply --session --show-context --session-file session.json --export-all all_mesh.ply
+```
+
+### 操作フロー
+
+1. 点群＋既存メッシュを表示  
+2. Shift+左クリックで seed を1点選択 → ウィンドウを閉じる  
+3. autoで plane/cylinder を評価し、一発抽出してシーンに追加  
+4. Enter で次の seed を選択  
+
+### キー（コンソール入力）
+
+- `Enter` : 次の seed 選択へ
+- `U` : 直前追加を Undo
+- `D` : 直前追加を削除
+- `S` : `--session-file` に保存
+- `E` : `--export-all` で全メッシュ出力
+- `Q` : 終了
+
+### オプション
+
+- `--force {auto,plane,cylinder}` : タイプ固定
+- `--seed-radius-start / --seed-radius-max / --seed-radius-step` : seed 半径の段階拡張
+- `--min-seed-points` : seed 最小点数
+
+セッションの JSON には `objects[]` が追加され、seed/params/quality/stop_reason が保存されます。
+
 ## Notes
 
 - v0 は研究用プロトタイプ。`fit_plane` / `fit_cylinder` はスタブ実装

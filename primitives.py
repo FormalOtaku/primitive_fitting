@@ -1284,6 +1284,15 @@ class CylinderProbeResult:
     seed_point_count: int = 0
 
 
+@dataclass
+class AutoSelectResult:
+    """Auto selection result for plane vs cylinder."""
+    chosen: str
+    plane_score: float
+    cylinder_score: float
+    reason: str
+
+
 def expand_cylinder_from_seed(
     points: np.ndarray,
     seed_center: np.ndarray,
@@ -1896,11 +1905,22 @@ def adaptive_seed_indices(
     min_points = max(int(min_seed_points), 1)
 
     best_indices = np.empty((0,), dtype=int)
+    tree = None
+    try:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        tree = o3d.geometry.KDTreeFlann(pcd)
+    except Exception:
+        tree = None
     while radius <= radius_max + 1e-9:
-        diff = pts - seed_center
-        dist2 = np.einsum("ij,ij->i", diff, diff)
-        mask = dist2 <= radius * radius
-        indices = np.where(mask)[0]
+        if tree is not None:
+            k, idx, _ = tree.search_radius_vector_3d(seed_center, radius)
+            indices = np.array(idx[:k], dtype=int)
+        else:
+            diff = pts - seed_center
+            dist2 = np.einsum("ij,ij->i", diff, diff)
+            mask = dist2 <= radius * radius
+            indices = np.where(mask)[0]
         best_indices = indices
         if len(indices) >= min_points:
             break
@@ -2145,6 +2165,73 @@ def _compute_cylinder_residual_stats(
     median = float(np.median(residuals))
     mad = float(np.median(np.abs(residuals - median)))
     return median, mad
+
+
+def compute_plane_residual_stats(
+    points: np.ndarray,
+    plane_point: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Tuple[float, float]:
+    """Compute plane residual median/MAD."""
+    pts = np.asarray(points, dtype=float)
+    plane_point = np.asarray(plane_point, dtype=float).reshape(-1)
+    plane_normal = np.asarray(plane_normal, dtype=float).reshape(-1)
+    if pts.ndim != 2 or pts.shape[1] != 3 or plane_point.size != 3 or plane_normal.size != 3:
+        return 0.0, 0.0
+    norm = np.linalg.norm(plane_normal)
+    if not np.isfinite(norm) or norm < 1e-12:
+        return 0.0, 0.0
+    plane_normal = plane_normal / norm
+    residuals = np.abs((pts - plane_point) @ plane_normal)
+    if residuals.size == 0:
+        return 0.0, 0.0
+    median = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - median)))
+    return median, mad
+
+
+def auto_select_primitive(
+    plane_result: Optional[SeedExpandPlaneResult],
+    cylinder_result: Optional[CylinderProbeResult],
+    *,
+    eps: float = 1e-6,
+    plane_threshold: float = 1.0,
+    cylinder_threshold: float = 1.0,
+) -> AutoSelectResult:
+    """Pick plane or cylinder based on scores."""
+    plane_score = -1.0
+    cylinder_score = -1.0
+    reason = ""
+
+    if plane_result is not None and plane_result.success and plane_result.expanded_inlier_count > 0:
+        norm = max(float(plane_threshold), eps)
+        plane_score = plane_result.expanded_inlier_count / max(float(plane_result.residual_median) / norm, eps)
+
+    if cylinder_result is not None and cylinder_result.success and cylinder_result.inlier_count > 0:
+        norm = max(float(cylinder_threshold), eps)
+        cylinder_score = cylinder_result.inlier_count / max(float(cylinder_result.residual_median) / norm, eps)
+
+    if plane_score < 0 and cylinder_score < 0:
+        return AutoSelectResult(
+            chosen="none",
+            plane_score=plane_score,
+            cylinder_score=cylinder_score,
+            reason="both_failed",
+        )
+
+    if cylinder_score > plane_score:
+        reason = "cylinder_score_higher"
+        chosen = "cylinder"
+    else:
+        reason = "plane_score_higher_or_equal"
+        chosen = "plane"
+
+    return AutoSelectResult(
+        chosen=chosen,
+        plane_score=float(plane_score),
+        cylinder_score=float(cylinder_score),
+        reason=reason,
+    )
 
 
 def finalize_cylinder_from_proxy(

@@ -19,11 +19,14 @@ from primitives import (
     PlaneParam, CylinderParam, extract_stair_planes,
     expand_plane_from_seed, expand_cylinder_from_seed,
     SeedExpandPlaneResult, SeedExpandCylinderResult,
-    compute_cylinder_proxy_from_seed, finalize_cylinder_from_proxy
+    compute_cylinder_proxy_from_seed, finalize_cylinder_from_proxy,
+    adaptive_seed_indices, compute_plane_residual_stats,
+    auto_select_primitive
 )
 
 SEED_EXPAND_RESULT_VERSION = 4
 CYLINDER_PROBE_RESULT_VERSION = 1
+SESSION_RESULT_VERSION = 1
 
 
 # =============================================================================
@@ -1314,6 +1317,34 @@ def parse_args():
         help=f"Sensor profile to use. Available: {', '.join(SENSOR_PROFILES.keys())}"
     )
 
+    # Session mode options
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        dest="session_mode",
+        help="Enable session mode: repeatedly click to extract and keep multiple primitives"
+    )
+    parser.add_argument(
+        "--session-file",
+        type=str,
+        default="session.json",
+        help="Session JSON file to read/write (default: session.json)"
+    )
+    parser.add_argument(
+        "--export-all",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export all primitives as a combined mesh (PLY/OBJ)"
+    )
+    parser.add_argument(
+        "--force",
+        type=str,
+        default="auto",
+        choices=["auto", "plane", "cylinder"],
+        help="Force primitive type in session mode (default: auto)"
+    )
+
     # Preprocessing options (can override profile)
     parser.add_argument(
         "--voxel-size",
@@ -1573,6 +1604,32 @@ def parse_args():
         default=None,
         metavar="FILE",
         help="Export expanded inlier points to PLY file (for debugging)"
+    )
+
+    session_seed_group = parser.add_argument_group("Session Seed Options")
+    session_seed_group.add_argument(
+        "--seed-radius-start",
+        type=float,
+        default=0.05,
+        help="Session seed radius start (meters, default: 0.05)"
+    )
+    session_seed_group.add_argument(
+        "--seed-radius-max",
+        type=float,
+        default=0.6,
+        help="Session seed radius max (meters, default: 0.6)"
+    )
+    session_seed_group.add_argument(
+        "--seed-radius-step",
+        type=float,
+        default=0.05,
+        help="Session seed radius step (meters, default: 0.05)"
+    )
+    session_seed_group.add_argument(
+        "--min-seed-points",
+        type=int,
+        default=80,
+        help="Minimum points required in seed region (default: 80)"
     )
 
     # Cylinder probe mode options
@@ -2120,6 +2177,24 @@ def create_axis_line(
     return line
 
 
+def build_mesh_from_polygon(
+    corners_world: np.ndarray,
+    color: np.ndarray,
+) -> Optional[o3d.geometry.TriangleMesh]:
+    corners = np.asarray(corners_world, dtype=float)
+    if corners.ndim != 2 or corners.shape[1] != 3 or len(corners) < 3:
+        return None
+    triangles = np.array([[0, i, i + 1] for i in range(1, len(corners) - 1)], dtype=int)
+    if len(triangles) == 0:
+        return None
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(corners)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.tile(color, (len(corners), 1)))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def save_seed_expand_result(
     result,
     primitive_type: str,
@@ -2288,6 +2363,404 @@ def save_cylinder_probe_result(
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
     print(f"Cylinder probe results saved to {filepath}")
+
+
+def load_session(filepath: str) -> dict:
+    """Load session JSON or initialize new."""
+    path = Path(filepath)
+    if path.exists():
+        with open(path, "r") as f:
+            data = json.load(f)
+        if "objects" not in data:
+            data["objects"] = []
+        if "version" not in data:
+            data["version"] = SESSION_RESULT_VERSION
+        return data
+    return {"version": SESSION_RESULT_VERSION, "objects": []}
+
+
+def save_session(filepath: str, data: dict) -> None:
+    """Save session JSON."""
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Session saved to {filepath}")
+
+
+def mesh_from_session_object(obj: dict) -> Optional[o3d.geometry.TriangleMesh]:
+    """Rebuild mesh from session object."""
+    obj_type = obj.get("type")
+    color = np.asarray(obj.get("color", [0.2, 0.6, 0.9]), dtype=float)
+    params = obj.get("params", {})
+    if obj_type == "plane":
+        corners = params.get("corners_world")
+        if corners is None:
+            return None
+        return build_mesh_from_polygon(np.asarray(corners, dtype=float), color)
+    if obj_type == "cylinder":
+        return create_cylinder_mesh(
+            params.get("axis_point", [0.0, 0.0, 0.0]),
+            params.get("axis_direction", [0.0, 0.0, 1.0]),
+            params.get("radius", 0.1),
+            params.get("length", 0.1),
+            color,
+        )
+    return None
+
+
+def run_session_mode(
+    pcd: o3d.geometry.PointCloud,
+    args,
+    profile: SensorProfile,
+    extra_config: dict,
+):
+    """Run workspace session mode for one-click extraction."""
+    print("\n" + "=" * 60)
+    print("  SESSION MODE")
+    print("=" * 60)
+    print("Controls after extraction:")
+    print("  [Enter] next seed | U undo | D delete last | S save | E export | Q quit")
+
+    all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+
+    session = load_session(args.session_file)
+    meshes: List[o3d.geometry.TriangleMesh] = []
+    for obj in session.get("objects", []):
+        mesh = mesh_from_session_object(obj)
+        if mesh is not None:
+            meshes.append(mesh)
+
+    context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+    context_pcd = None
+    if args.show_context:
+        context_pcd = create_context_cloud(
+            pcd,
+            args.context_voxel,
+            center=None,
+            radius=context_radius,
+        )
+
+    rng = np.random.default_rng(1234)
+
+    def show_scene_for_pick():
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name="Session Pick (Shift+Click, close to confirm)")
+        if context_pcd is not None and not context_pcd.is_empty():
+            vis.add_geometry(context_pcd)
+        else:
+            vis.add_geometry(pcd)
+        for mesh in meshes:
+            vis.add_geometry(mesh)
+        vis.run()
+        picked = vis.get_picked_points()
+        vis.destroy_window()
+        return picked
+
+    def show_scene():
+        geometries = []
+        if context_pcd is not None and not context_pcd.is_empty():
+            geometries.append(context_pcd)
+        else:
+            base = o3d.geometry.PointCloud(pcd)
+            base.paint_uniform_color([0.6, 0.6, 0.6])
+            geometries.append(base)
+        geometries.extend(meshes)
+        o3d.visualization.draw_geometries(geometries, window_name="Session Workspace")
+
+    while True:
+        picked = show_scene_for_pick()
+        if not picked:
+            print("No point selected. Exiting session.")
+            break
+
+        seed_idx = picked[0]
+        seed_center = all_points[seed_idx]
+        print(f"\nSeed: {np.round(seed_center, 4).tolist()}")
+
+        seed_indices, seed_radius = adaptive_seed_indices(
+            all_points,
+            seed_center,
+            seed_radius_start=args.seed_radius_start,
+            seed_radius_max=args.seed_radius_max,
+            seed_radius_step=args.seed_radius_step,
+            min_seed_points=args.min_seed_points,
+        )
+        print(f"  Seed radius used: {seed_radius:.3f} m ({len(seed_indices)} pts)")
+
+        plane_result = None
+        cylinder_result = None
+        plane_mesh = None
+        plane_metrics = None
+        plane_quality = {}
+        cylinder_quality = {}
+        cyl_proxy = None
+        plane_color = None
+
+        surface_th = profile.cylinder_distance_threshold
+
+        if args.force in ("auto", "plane"):
+            plane_result = expand_plane_from_seed(
+                all_points,
+                seed_center,
+                normals=all_normals,
+                seed_radius=seed_radius,
+                max_expand_radius=args.max_expand_radius,
+                grow_radius=args.grow_radius,
+                distance_threshold=profile.plane_distance_threshold,
+                normal_threshold_deg=args.normal_th,
+                expand_method=args.expand_method,
+                max_refine_iters=args.max_refine_iters,
+                adaptive_refine_threshold=args.adaptive_plane_refine_th,
+                adaptive_refine_k=args.adaptive_plane_refine_k,
+                adaptive_refine_min_scale=args.adaptive_plane_refine_min_scale,
+                adaptive_refine_max_scale=args.adaptive_plane_refine_max_scale,
+                max_expanded_points=args.max_expanded_points,
+                max_frontier=args.max_frontier,
+                max_steps=args.max_steps,
+                verbose=False,
+            )
+            if plane_result.success and plane_result.plane is not None:
+                plane_color = rng.uniform(0.2, 0.9, size=3)
+                plane_indices = plane_result.expanded_inlier_indices
+                if plane_indices is None and plane_result.plane.inlier_indices is not None:
+                    plane_indices = plane_result.plane.inlier_indices
+                if plane_indices is None:
+                    plane_indices = np.empty((0,), dtype=int)
+                plane_res_median, plane_res_mad = compute_plane_residual_stats(
+                    all_points[np.asarray(plane_indices, dtype=int)],
+                    plane_result.plane.point,
+                    plane_result.plane.normal,
+                )
+                plane_quality = {
+                    "inlier_count": int(plane_result.expanded_inlier_count),
+                    "residual_median": float(plane_res_median),
+                    "residual_mad": float(plane_res_mad),
+                    "area": float(plane_result.area),
+                    "extent_u": float(plane_result.extent_u),
+                    "extent_v": float(plane_result.extent_v),
+                    "tilt_deg": float(plane_tilt_deg(plane_result.plane.normal)),
+                    "stop_reason": str(plane_result.stop_reason),
+                }
+                try:
+                    plane_mesh, plane_metrics = create_plane_patch_mesh(
+                        plane_result.plane,
+                        all_points,
+                        plane_color,
+                        padding=0.02,
+                        patch_shape=args.patch_shape,
+                    )
+                except Exception as exc:
+                    plane_metrics = {
+                        "patch_shape": args.patch_shape,
+                        "corners_world": np.empty((0, 3), dtype=float),
+                        "patch_fallback_reason": str(exc),
+                        "area": float(plane_result.area),
+                        "extent_u": float(plane_result.extent_u),
+                        "extent_v": float(plane_result.extent_v),
+                    }
+            else:
+                if plane_result is not None:
+                    print(f"  Plane failed: {plane_result.message}")
+
+        if args.force in ("auto", "cylinder"):
+            proxy_init = compute_cylinder_proxy_from_seed(
+                all_points,
+                seed_center,
+                seed_radius_start=args.seed_radius_start,
+                seed_radius_max=args.seed_radius_max,
+                seed_radius_step=args.seed_radius_step,
+                min_seed_points=args.min_seed_points,
+                circle_ransac_iters=200,
+                circle_inlier_threshold=surface_th,
+                length_margin=0.05,
+            )
+            if proxy_init.success and proxy_init.cylinder is not None:
+                cyl_proxy = proxy_init.cylinder
+                cylinder_result = finalize_cylinder_from_proxy(
+                    all_points,
+                    seed_center,
+                    proxy_init.seed_indices,
+                    cyl_proxy,
+                    surface_threshold=surface_th,
+                    cap_margin=0.05,
+                    grow_radius=args.grow_radius,
+                    max_expand_radius=args.max_expand_radius,
+                    max_expanded_points=args.max_expanded_points,
+                    max_frontier=args.max_frontier,
+                    max_steps=args.max_steps,
+                    refine_iters=min(3, max(1, int(args.max_refine_iters))),
+                    circle_ransac_iters=200,
+                    circle_inlier_threshold=surface_th,
+                    allow_length_growth=True,
+                )
+                if cylinder_result.success and cylinder_result.final is not None:
+                    cylinder_quality = {
+                        "inlier_count": int(cylinder_result.inlier_count),
+                        "residual_median": float(cylinder_result.residual_median),
+                        "residual_mad": float(cylinder_result.residual_mad),
+                        "stop_reason": str(cylinder_result.stop_reason),
+                        "candidate_count": int(cylinder_result.candidate_count),
+                    }
+                else:
+                    if cylinder_result is not None:
+                        print(f"  Cylinder failed: {cylinder_result.message}")
+            else:
+                print(f"  Cylinder proxy init failed: {proxy_init.message}")
+
+        chosen_type = args.force
+        plane_score = -1.0
+        cylinder_score = -1.0
+        if args.force == "auto":
+            select = auto_select_primitive(
+                plane_result,
+                cylinder_result,
+                plane_threshold=profile.plane_distance_threshold,
+                cylinder_threshold=profile.cylinder_distance_threshold,
+            )
+            chosen_type = select.chosen
+            plane_score = select.plane_score
+            cylinder_score = select.cylinder_score
+            print(
+                f"  Auto scores: plane={plane_score:.2f}, cylinder={cylinder_score:.2f} -> {chosen_type}"
+            )
+
+        if chosen_type == "none":
+            print("  No valid primitive found. Continuing.")
+            continue
+
+        if chosen_type == "plane":
+            if plane_result is None or not plane_result.success or plane_result.plane is None:
+                print("  Plane extraction failed. Continuing.")
+                continue
+            color = plane_color if plane_color is not None else rng.uniform(0.2, 0.9, size=3)
+            if plane_mesh is None and plane_metrics is not None:
+                plane_mesh = build_mesh_from_polygon(
+                    plane_metrics.get("corners_world", np.empty((0, 3))),
+                    color,
+                )
+            if plane_mesh is None:
+                print("  Plane mesh unavailable; skipping.")
+                continue
+            meshes.append(plane_mesh)
+
+            corners_world = None
+            if plane_metrics is not None and plane_metrics.get("corners_world") is not None:
+                corners_world = np.asarray(plane_metrics["corners_world"], dtype=float).tolist()
+
+            obj = {
+                "id": len(session["objects"]),
+                "type": "plane",
+                "seed": {
+                    "center": seed_center.tolist(),
+                    "radius": float(seed_radius),
+                    "point_count": int(len(seed_indices)),
+                },
+                "params": {
+                    "normal": plane_result.plane.normal.tolist(),
+                    "point": plane_result.plane.point.tolist(),
+                    "tilt_deg": float(plane_tilt_deg(plane_result.plane.normal)),
+                    "area": float(plane_result.area),
+                    "extent_u": float(plane_result.extent_u),
+                    "extent_v": float(plane_result.extent_v),
+                    "patch_shape": plane_metrics.get("patch_shape") if plane_metrics else None,
+                    "corners_world": corners_world,
+                    "patch_fallback_reason": plane_metrics.get("patch_fallback_reason") if plane_metrics else None,
+                },
+                "quality": {
+                    **plane_quality,
+                    "score": float(plane_score if args.force == "auto" else plane_quality.get("inlier_count", 0)),
+                },
+                "stop_reason": str(plane_result.stop_reason),
+                "color": color.tolist(),
+            }
+            session["objects"].append(obj)
+        elif chosen_type == "cylinder":
+            if cylinder_result is None or not cylinder_result.success or cylinder_result.final is None:
+                print("  Cylinder extraction failed. Continuing.")
+                continue
+            final = cylinder_result.final
+            axis_dir = unit_vector(final.axis_direction)
+            end0, end1 = cylinder_endpoints(final.axis_point, axis_dir, final.length)
+            color = rng.uniform(0.2, 0.9, size=3)
+            cyl_mesh = create_cylinder_mesh(
+                final.axis_point,
+                axis_dir,
+                final.radius,
+                final.length,
+                color,
+            )
+            meshes.append(cyl_mesh)
+            obj = {
+                "id": len(session["objects"]),
+                "type": "cylinder",
+                "seed": {
+                    "center": seed_center.tolist(),
+                    "radius": float(seed_radius),
+                    "point_count": int(len(seed_indices)),
+                },
+                "params": {
+                    "axis_point": final.axis_point.tolist(),
+                    "axis_direction": axis_dir.tolist(),
+                    "radius": float(final.radius),
+                    "diameter": float(final.radius * 2.0),
+                    "length": float(final.length),
+                    "end_center_0": end0.tolist(),
+                    "end_center_1": end1.tolist(),
+                },
+                "quality": {
+                    **cylinder_quality,
+                    "score": float(cylinder_score if args.force == "auto" else cylinder_quality.get("inlier_count", 0)),
+                },
+                "stop_reason": str(cylinder_result.stop_reason),
+                "color": color.tolist(),
+            }
+            if cyl_proxy is not None:
+                proxy_axis = unit_vector(cyl_proxy.axis_direction)
+                p0, p1 = cylinder_endpoints(cyl_proxy.axis_point, proxy_axis, cyl_proxy.length)
+                obj["proxy"] = {
+                    "axis_point": cyl_proxy.axis_point.tolist(),
+                    "axis_direction": proxy_axis.tolist(),
+                    "radius": float(cyl_proxy.radius),
+                    "diameter": float(cyl_proxy.radius * 2.0),
+                    "length": float(cyl_proxy.length),
+                    "end_center_0": p0.tolist(),
+                    "end_center_1": p1.tolist(),
+                }
+            session["objects"].append(obj)
+        else:
+            print("  Unknown selection, skipping.")
+            continue
+
+        show_scene()
+
+        while True:
+            cmd = input("\n[Enter] next | U undo | D delete | S save | E export | Q quit: ").strip().lower()
+            if cmd == "":
+                break
+            if cmd == "u" or cmd == "d":
+                if session["objects"]:
+                    session["objects"].pop()
+                    if meshes:
+                        meshes.pop()
+                    print("Undid last object.")
+                break
+            if cmd == "s":
+                save_session(args.session_file, session)
+                continue
+            if cmd == "e":
+                if args.export_all:
+                    combined = _combine_meshes(meshes)
+                    o3d.io.write_triangle_mesh(args.export_all, combined)
+                    print(f"Exported all meshes to {args.export_all}")
+                else:
+                    print("No --export-all specified.")
+                continue
+            if cmd == "q":
+                save_session(args.session_file, session)
+                return
+            print("Unknown command.")
+
+    save_session(args.session_file, session)
 
 
 def run_seed_expand_mode(
@@ -3288,6 +3761,13 @@ def main():
     if args.cyl_probe and args.seed_expand:
         print("Error: --cyl-probe and --seed-expand cannot be used together.")
         sys.exit(2)
+    if args.session_mode and (args.cyl_probe or args.seed_expand or args.stairs_mode):
+        print("Error: --session cannot be combined with other modes.")
+        sys.exit(2)
+
+    if args.session_mode:
+        run_session_mode(pcd, args, profile, extra_config)
+        return
 
     # Cylinder probe mode
     if args.cyl_probe:
