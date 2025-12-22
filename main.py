@@ -16,12 +16,17 @@ import numpy as np
 import open3d as o3d
 
 from primitives import (
-    fit_plane, fit_cylinder, PlaneParam, CylinderParam, extract_stair_planes,
+    PlaneParam, CylinderParam, extract_stair_planes,
     expand_plane_from_seed, expand_cylinder_from_seed,
-    SeedExpandPlaneResult, SeedExpandCylinderResult
+    SeedExpandPlaneResult, SeedExpandCylinderResult,
+    compute_cylinder_proxy_from_seed, finalize_cylinder_from_proxy,
+    adaptive_seed_indices, compute_plane_residual_stats,
+    auto_select_primitive
 )
 
-SEED_EXPAND_RESULT_VERSION = 3
+SEED_EXPAND_RESULT_VERSION = 4
+CYLINDER_PROBE_RESULT_VERSION = 1
+SESSION_RESULT_VERSION = 1
 
 
 # =============================================================================
@@ -926,6 +931,7 @@ def create_plane_patch_mesh(
         "hull_area": float(hull_area),
         "patch_shape": selected_shape,
         "patch_shape_requested": requested_shape,
+        "corners_world": vertices,
     }
     if rect_corners_world is not None:
         metrics["rect_corners_world"] = rect_corners_world
@@ -1311,6 +1317,53 @@ def parse_args():
         help=f"Sensor profile to use. Available: {', '.join(SENSOR_PROFILES.keys())}"
     )
 
+    # Session mode options
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        dest="session_mode",
+        help="Enable session mode: repeatedly click to extract and keep multiple primitives"
+    )
+    parser.add_argument(
+        "--session-file",
+        type=str,
+        default="session.json",
+        help="Session JSON file to read/write (default: session.json)"
+    )
+    parser.add_argument(
+        "--session-reset",
+        action="store_true",
+        dest="session_reset",
+        help="Start session from empty (ignore existing session-file)"
+    )
+    parser.add_argument(
+        "--export-all",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export all primitives as a combined mesh (PLY/OBJ)"
+    )
+    parser.add_argument(
+        "--force",
+        type=str,
+        default="auto",
+        choices=["auto", "plane", "cylinder"],
+        help="Force primitive type in session mode (default: auto)"
+    )
+    parser.add_argument(
+        "--session-dedup",
+        action="store_true",
+        dest="session_dedup",
+        default=True,
+        help="Enable session deduplication (default: on)"
+    )
+    parser.add_argument(
+        "--session-no-dedup",
+        action="store_false",
+        dest="session_dedup",
+        help="Disable session deduplication"
+    )
+
     # Preprocessing options (can override profile)
     parser.add_argument(
         "--voxel-size",
@@ -1467,7 +1520,7 @@ def parse_args():
         type=str,
         default=None,
         metavar="FILE",
-        help="Export stair plane meshes to PLY/OBJ file (e.g., stairs_planes.ply)"
+        help="Export meshes to PLY/OBJ file (stairs mode or cylinder probe)"
     )
 
     # Seed-expand mode options
@@ -1572,7 +1625,201 @@ def parse_args():
         help="Export expanded inlier points to PLY file (for debugging)"
     )
 
+    session_seed_group = parser.add_argument_group("Session Seed Options")
+    session_seed_group.add_argument(
+        "--seed-radius-start",
+        type=float,
+        default=0.05,
+        help="Session seed radius start (meters, default: 0.05)"
+    )
+    session_seed_group.add_argument(
+        "--seed-radius-max",
+        type=float,
+        default=0.6,
+        help="Session seed radius max (meters, default: 0.6)"
+    )
+    session_seed_group.add_argument(
+        "--seed-radius-step",
+        type=float,
+        default=0.05,
+        help="Session seed radius step (meters, default: 0.05)"
+    )
+    session_seed_group.add_argument(
+        "--min-seed-points",
+        type=int,
+        default=80,
+        help="Minimum points required in seed region (default: 80)"
+    )
+
+    # Cylinder probe mode options
+    probe_group = parser.add_argument_group("Cylinder Probe Mode Options")
+    probe_group.add_argument(
+        "--cyl-probe",
+        action="store_true",
+        dest="cyl_probe",
+        help="Enable interactive cylinder probe mode"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-seed-start",
+        type=float,
+        default=0.05,
+        help="Initial seed radius for probe (meters, default: 0.05)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-seed-max",
+        type=float,
+        default=0.5,
+        help="Maximum seed radius for probe (meters, default: 0.5)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-seed-step",
+        type=float,
+        default=0.05,
+        help="Seed radius growth step (meters, default: 0.05)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-min-seed-points",
+        type=int,
+        default=80,
+        help="Minimum points required in seed for probe (default: 80)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-surface-th",
+        type=float,
+        default=None,
+        help="Surface distance threshold for probe (default: use cylinder threshold)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-cap-margin",
+        type=float,
+        default=0.05,
+        help="End-cap margin for probe selection (meters, default: 0.05)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-refine-iters",
+        type=int,
+        default=2,
+        help="Refinement iterations for probe (default: 2)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-axis-refit",
+        action="store_true",
+        dest="cyl_probe_axis_refit",
+        help="Allow axis direction refit during probe finalization (default: off, keeps proxy/user axis)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-output",
+        type=str,
+        default="cyl_probe_results.json",
+        help="Output JSON file for cylinder probe results (default: cyl_probe_results.json)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-axis-snap-deg",
+        type=float,
+        default=0.0,
+        dest="cyl_probe_axis_snap_deg",
+        help="Snap axis to vertical if within N degrees (default: 0 = disabled)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-axis-reg-weight",
+        type=float,
+        default=0.02,
+        dest="cyl_probe_axis_reg_weight",
+        help="Axis regularization weight (penalize deviation from reference, default: 0.02)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-no-recompute-length",
+        action="store_true",
+        dest="cyl_probe_no_recompute_length",
+        help="Disable length recomputation from final inliers"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-diagnostics-dir",
+        type=str,
+        default=None,
+        dest="cyl_probe_diagnostics_dir",
+        help="Directory to export debug PLY files (seed, candidates, inliers)"
+    )
+
+    # Cylinder prior options
+    cyl_prior_group = parser.add_argument_group("Cylinder Prior Options")
+    cyl_prior_group.add_argument(
+        "--cylinder-init-axis-point",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Initial cylinder axis point (use with --cylinder-init-axis-dir and --cylinder-init-radius)"
+    )
+    cyl_prior_group.add_argument(
+        "--cylinder-init-axis-dir",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Initial cylinder axis direction (use with --cylinder-init-axis-point and --cylinder-init-radius)"
+    )
+    cyl_prior_group.add_argument(
+        "--cylinder-init-radius",
+        type=float,
+        default=None,
+        help="Initial cylinder radius in meters"
+    )
+    cyl_prior_group.add_argument(
+        "--cylinder-init-length",
+        type=float,
+        default=None,
+        help="Initial cylinder length in meters (optional; used if expansion fails)"
+    )
+
     return parser.parse_args()
+
+
+def resolve_initial_cylinder(args) -> Optional[CylinderParam]:
+    """Resolve an optional initial cylinder prior from CLI args."""
+    axis_point = args.cylinder_init_axis_point
+    axis_dir = args.cylinder_init_axis_dir
+    radius = args.cylinder_init_radius
+    length = args.cylinder_init_length
+
+    if axis_point is None and axis_dir is None and radius is None and length is None:
+        return None
+
+    missing = []
+    if axis_point is None:
+        missing.append("--cylinder-init-axis-point")
+    if axis_dir is None:
+        missing.append("--cylinder-init-axis-dir")
+    if radius is None:
+        missing.append("--cylinder-init-radius")
+    if missing:
+        raise ValueError("Cylinder prior requires: " + ", ".join(missing))
+
+    axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    if axis_point.size != 3 or axis_dir.size != 3:
+        raise ValueError("Cylinder prior axis point/dir must be 3D vectors")
+
+    axis_norm = np.linalg.norm(axis_dir)
+    if not np.isfinite(axis_norm) or axis_norm < 1e-12:
+        raise ValueError("Cylinder prior axis direction is invalid")
+
+    radius = float(radius)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("Cylinder prior radius must be positive")
+
+    length_val = float(length) if length is not None else 0.0
+    if not np.isfinite(length_val):
+        length_val = 0.0
+
+    return CylinderParam(
+        axis_point=axis_point,
+        axis_direction=axis_dir,
+        radius=radius,
+        length=length_val,
+        inlier_count=0,
+        inlier_indices=None,
+    )
 
 
 def build_effective_config(args) -> Tuple[SensorProfile, dict]:
@@ -1887,6 +2134,142 @@ def visualize_seed_expand_cylinder(
     )
 
 
+def unit_vector(vec: np.ndarray) -> np.ndarray:
+    """Return a unit vector or zeros if invalid."""
+    vec = np.asarray(vec, dtype=float).reshape(-1)
+    if vec.size != 3:
+        return np.zeros(3, dtype=float)
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm < 1e-12:
+        return np.zeros(3, dtype=float)
+    return vec / norm
+
+
+def plane_tilt_deg(normal: np.ndarray) -> float:
+    normal = unit_vector(normal)
+    nz = float(np.clip(abs(normal[2]), -1.0, 1.0))
+    return float(np.rad2deg(np.arccos(nz)))
+
+
+def cylinder_endpoints(axis_point: np.ndarray, axis_dir: np.ndarray, length: float) -> tuple[np.ndarray, np.ndarray]:
+    axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_dir = unit_vector(axis_dir)
+    if axis_point.size != 3:
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
+    half = 0.5 * float(length)
+    return axis_point - axis_dir * half, axis_point + axis_dir * half
+
+
+def rotate_vector(vec: np.ndarray, axis: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate vec around axis by angle_deg using Rodrigues' formula."""
+    vec = np.asarray(vec, dtype=float).reshape(-1)
+    axis = unit_vector(axis)
+    if vec.size != 3 or axis.size != 3:
+        return vec
+    angle = np.deg2rad(float(angle_deg))
+    cos_a = float(np.cos(angle))
+    sin_a = float(np.sin(angle))
+    return (
+        vec * cos_a
+        + np.cross(axis, vec) * sin_a
+        + axis * float(np.dot(axis, vec)) * (1.0 - cos_a)
+    )
+
+
+def create_cylinder_mesh(
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    radius: float,
+    length: float,
+    color: np.ndarray,
+    *,
+    resolution: int = 40,
+    split: int = 4,
+) -> o3d.geometry.TriangleMesh:
+    """Create a cylinder mesh oriented to axis_dir."""
+    radius = float(max(radius, 1e-4))
+    length = float(max(length, 1e-4))
+    mesh = o3d.geometry.TriangleMesh.create_cylinder(
+        radius=radius,
+        height=length,
+        resolution=resolution,
+        split=split,
+    )
+    axis_dir = unit_vector(axis_dir)
+    z_axis = np.array([0.0, 0.0, 1.0])
+    dot = float(np.clip(np.dot(z_axis, axis_dir), -1.0, 1.0))
+    if dot < 1.0 - 1e-8:
+        if dot < -1.0 + 1e-8:
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle([np.pi, 0.0, 0.0])
+        else:
+            rot_axis = np.cross(z_axis, axis_dir)
+            rot_axis = rot_axis / np.maximum(np.linalg.norm(rot_axis), 1e-8)
+            angle = float(np.arccos(dot))
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_axis * angle)
+        mesh.rotate(R, center=[0, 0, 0])
+    mesh.translate(np.asarray(axis_point, dtype=float))
+    mesh.paint_uniform_color(np.asarray(color, dtype=float))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def create_axis_line(
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    length: float,
+    color: np.ndarray,
+) -> o3d.geometry.LineSet:
+    """Create a LineSet for a cylinder axis."""
+    axis_dir = unit_vector(axis_dir)
+    start, end = cylinder_endpoints(axis_point, axis_dir, length)
+    line = o3d.geometry.LineSet()
+    line.points = o3d.utility.Vector3dVector([start, end])
+    line.lines = o3d.utility.Vector2iVector([[0, 1]])
+    line.colors = o3d.utility.Vector3dVector([np.asarray(color, dtype=float)])
+    return line
+
+
+def colorize_point_cloud_by_height(
+    pcd: o3d.geometry.PointCloud,
+    *,
+    axis: int = 2,
+) -> o3d.geometry.PointCloud:
+    """Apply a simple height colormap to a point cloud copy."""
+    colored = o3d.geometry.PointCloud(pcd)
+    pts = np.asarray(colored.points)
+    if pts.size == 0:
+        return colored
+    z = pts[:, axis]
+    z_min = float(np.percentile(z, 5))
+    z_max = float(np.percentile(z, 95))
+    if not np.isfinite(z_min) or not np.isfinite(z_max) or abs(z_max - z_min) < 1e-9:
+        colored.paint_uniform_color([0.7, 0.7, 0.7])
+        return colored
+    t = (z - z_min) / (z_max - z_min)
+    t = np.clip(t, 0.0, 1.0)
+    colors = np.column_stack([t, 0.2 + 0.6 * (1.0 - t), 1.0 - t])
+    colored.colors = o3d.utility.Vector3dVector(colors)
+    return colored
+
+
+def build_mesh_from_polygon(
+    corners_world: np.ndarray,
+    color: np.ndarray,
+) -> Optional[o3d.geometry.TriangleMesh]:
+    corners = np.asarray(corners_world, dtype=float)
+    if corners.ndim != 2 or corners.shape[1] != 3 or len(corners) < 3:
+        return None
+    triangles = np.array([[0, i, i + 1] for i in range(1, len(corners) - 1)], dtype=int)
+    if len(triangles) == 0:
+        return None
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(corners)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.tile(color, (len(corners), 1)))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def save_seed_expand_result(
     result,
     primitive_type: str,
@@ -1918,37 +2301,69 @@ def save_seed_expand_result(
             "steps": int(getattr(result, "steps", 0)),
             "max_frontier_size": int(getattr(result, "max_frontier_size", 0)),
             "residual_median": float(getattr(result, "residual_median", 0.0)),
+            "residual_mad": float(getattr(result, "residual_mad", 0.0)),
             "residual_p90": float(getattr(result, "residual_p90", 0.0)),
             "residual_p95": float(getattr(result, "residual_p95", 0.0)),
         },
     }
 
     if primitive_type == "plane" and result.plane is not None:
+        tilt = plane_tilt_deg(result.plane.normal)
         data["plane"] = {
             "normal": result.plane.normal.tolist(),
             "point": result.plane.point.tolist(),
+            "tilt_deg": tilt,
             "inlier_count": result.plane.inlier_count,
+            "area": float(result.area),
+            "extent_u": float(result.extent_u),
+            "extent_v": float(result.extent_v),
         }
-        data["area"] = result.area
-        data["extent_u"] = result.extent_u
-        data["extent_v"] = result.extent_v
-        if patch_metrics is not None:
-            plane_patch_shape = patch_metrics.get("patch_shape") if isinstance(patch_metrics, dict) else None
-            if plane_patch_shape:
-                data["plane"]["patch_shape"] = plane_patch_shape
-            if isinstance(patch_metrics, dict) and patch_metrics.get("rect_corners_world") is not None:
-                data["plane"]["rect_corners_world"] = np.asarray(
-                    patch_metrics["rect_corners_world"]
-                ).tolist()
-            if isinstance(patch_metrics, dict) and patch_metrics.get("patch_fallback_reason"):
-                data["plane"]["patch_fallback_reason"] = patch_metrics["patch_fallback_reason"]
+        data["area"] = float(result.area)
+        data["extent_u"] = float(result.extent_u)
+        data["extent_v"] = float(result.extent_v)
+        if patch_metrics is None:
+            patch_metrics = {
+                "patch_shape": "unknown",
+                "corners_world": [],
+                "patch_fallback_reason": "patch_metrics_missing",
+            }
+        plane_patch_shape = patch_metrics.get("patch_shape") if isinstance(patch_metrics, dict) else None
+        if plane_patch_shape:
+            data["plane"]["patch_shape"] = plane_patch_shape
+        if isinstance(patch_metrics, dict) and patch_metrics.get("corners_world") is not None:
+            data["plane"]["corners_world"] = np.asarray(
+                patch_metrics["corners_world"]
+            ).tolist()
+        if isinstance(patch_metrics, dict) and patch_metrics.get("rect_corners_world") is not None:
+            data["plane"]["rect_corners_world"] = np.asarray(
+                patch_metrics["rect_corners_world"]
+            ).tolist()
+        if isinstance(patch_metrics, dict) and patch_metrics.get("patch_fallback_reason"):
+            data["plane"]["patch_fallback_reason"] = patch_metrics["patch_fallback_reason"]
+        if isinstance(patch_metrics, dict) and patch_metrics.get("hull_area") is not None:
+            data["plane"]["hull_area"] = float(patch_metrics["hull_area"])
+        if isinstance(patch_metrics, dict) and patch_metrics.get("extent_u") is not None:
+            data["plane"]["patch_extent_u"] = float(patch_metrics["extent_u"])
+        if isinstance(patch_metrics, dict) and patch_metrics.get("extent_v") is not None:
+            data["plane"]["patch_extent_v"] = float(patch_metrics["extent_v"])
     elif primitive_type == "cylinder" and result.cylinder is not None:
+        axis_dir = unit_vector(result.cylinder.axis_direction)
+        end0, end1 = cylinder_endpoints(
+            result.cylinder.axis_point,
+            axis_dir,
+            result.cylinder.length,
+        )
         data["cylinder"] = {
             "axis_point": result.cylinder.axis_point.tolist(),
-            "axis_direction": result.cylinder.axis_direction.tolist(),
+            "axis_direction": axis_dir.tolist(),
             "radius": result.cylinder.radius,
+            "diameter": float(result.cylinder.radius * 2.0),
             "length": result.cylinder.length,
+            "end_center_0": end0.tolist(),
+            "end_center_1": end1.tolist(),
             "inlier_count": result.cylinder.inlier_count,
+            "residual_median": float(getattr(result, "residual_median", 0.0)),
+            "residual_mad": float(getattr(result, "residual_mad", 0.0)),
         }
 
     with open(filepath, 'w') as f:
@@ -1956,11 +2371,573 @@ def save_seed_expand_result(
     print(f"Seed-expand results saved to {filepath}")
 
 
+def save_cylinder_probe_result(
+    result,
+    proxy: Optional[CylinderParam],
+    final: Optional[CylinderParam],
+    filepath: str,
+    seed_center: np.ndarray,
+    params: dict,
+    control_log: dict,
+):
+    """Save cylinder probe result to JSON."""
+    data = {
+        "mode": "cylinder_probe",
+        "version": CYLINDER_PROBE_RESULT_VERSION,
+        "seed_center": np.asarray(seed_center, dtype=float).tolist(),
+        "success": bool(getattr(result, "success", False)),
+        "message": str(getattr(result, "message", "")),
+        "params": params,
+        "controls": control_log,
+        "stats": {
+            "candidate_count": int(getattr(result, "candidate_count", 0)),
+            "inlier_count": int(getattr(result, "inlier_count", 0)),
+            "residual_median": float(getattr(result, "residual_median", 0.0)),
+            "residual_mad": float(getattr(result, "residual_mad", 0.0)),
+            "stopped_early": bool(getattr(result, "stopped_early", False)),
+            "stop_reason": str(getattr(result, "stop_reason", "")),
+            "steps": int(getattr(result, "steps", 0)),
+            "max_frontier_size": int(getattr(result, "max_frontier_size", 0)),
+        },
+        "seed": {
+            "center": np.asarray(seed_center, dtype=float).tolist(),
+            "radius": float(params.get("seed_radius_used", 0.0)),
+            "point_count": int(params.get("seed_point_count", 0)),
+        },
+    }
+
+    if proxy is not None:
+        proxy_axis = unit_vector(proxy.axis_direction)
+        p0, p1 = cylinder_endpoints(proxy.axis_point, proxy_axis, proxy.length)
+        data["proxy"] = {
+            "axis_point": np.asarray(proxy.axis_point, dtype=float).tolist(),
+            "axis_direction": proxy_axis.tolist(),
+            "radius": float(proxy.radius),
+            "diameter": float(proxy.radius * 2.0),
+            "length": float(proxy.length),
+            "end_center_0": p0.tolist(),
+            "end_center_1": p1.tolist(),
+        }
+
+    if final is not None:
+        final_axis = unit_vector(final.axis_direction)
+        f0, f1 = cylinder_endpoints(final.axis_point, final_axis, final.length)
+        data["final"] = {
+            "axis_point": np.asarray(final.axis_point, dtype=float).tolist(),
+            "axis_direction": final_axis.tolist(),
+            "radius": float(final.radius),
+            "diameter": float(final.radius * 2.0),
+            "length": float(final.length),
+            "end_center_0": f0.tolist(),
+            "end_center_1": f1.tolist(),
+            "inlier_count": int(final.inlier_count),
+            "residual_median": float(getattr(result, "residual_median", 0.0)),
+            "residual_mad": float(getattr(result, "residual_mad", 0.0)),
+        }
+
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Cylinder probe results saved to {filepath}")
+
+
+def load_session(filepath: str) -> dict:
+    """Load session JSON or initialize new."""
+    path = Path(filepath)
+    if path.exists():
+        with open(path, "r") as f:
+            data = json.load(f)
+        if "objects" not in data:
+            data["objects"] = []
+        if "version" not in data:
+            data["version"] = SESSION_RESULT_VERSION
+        return data
+    return {"version": SESSION_RESULT_VERSION, "objects": []}
+
+
+def save_session(filepath: str, data: dict) -> None:
+    """Save session JSON."""
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Session saved to {filepath}")
+
+
+def mesh_from_session_object(obj: dict) -> Optional[o3d.geometry.TriangleMesh]:
+    """Rebuild mesh from session object."""
+    obj_type = obj.get("type")
+    color = np.asarray(obj.get("color", [0.2, 0.6, 0.9]), dtype=float)
+    params = obj.get("params", {})
+    if obj_type == "plane":
+        corners = params.get("corners_world")
+        if corners is None:
+            return None
+        return build_mesh_from_polygon(np.asarray(corners, dtype=float), color)
+    if obj_type == "cylinder":
+        return create_cylinder_mesh(
+            params.get("axis_point", [0.0, 0.0, 0.0]),
+            params.get("axis_direction", [0.0, 0.0, 1.0]),
+            params.get("radius", 0.1),
+            params.get("length", 0.1),
+            color,
+        )
+    return None
+
+
+def _axis_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    a = unit_vector(a)
+    b = unit_vector(b)
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return float(np.rad2deg(np.arccos(abs(dot))))
+
+
+def _axis_distance(p0: np.ndarray, d0: np.ndarray, p1: np.ndarray, d1: np.ndarray) -> float:
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    d0 = unit_vector(d0)
+    d1 = unit_vector(d1)
+    cross = np.cross(d0, d1)
+    cross_norm = np.linalg.norm(cross)
+    if cross_norm < 1e-8:
+        diff = p1 - p0
+        return float(np.linalg.norm(diff - np.dot(diff, d0) * d0))
+    diff = p1 - p0
+    return float(abs(np.dot(diff, cross)) / cross_norm)
+
+
+def find_duplicate_cylinder(
+    new_obj: dict,
+    objects: list,
+    *,
+    angle_deg: float = 12.0,
+    axis_dist: float = 0.15,
+    radius_rel: float = 0.25,
+    radius_abs: float = 0.03,
+) -> Optional[int]:
+    params = new_obj.get("params", {})
+    axis_point = np.asarray(params.get("axis_point", [0.0, 0.0, 0.0]), dtype=float)
+    axis_dir = np.asarray(params.get("axis_direction", [0.0, 0.0, 1.0]), dtype=float)
+    radius = float(params.get("radius", 0.0))
+
+    for idx, obj in enumerate(objects):
+        if obj.get("type") != "cylinder":
+            continue
+        p = obj.get("params", {})
+        op = np.asarray(p.get("axis_point", [0.0, 0.0, 0.0]), dtype=float)
+        od = np.asarray(p.get("axis_direction", [0.0, 0.0, 1.0]), dtype=float)
+        orad = float(p.get("radius", 0.0))
+        if radius <= 0 or orad <= 0:
+            continue
+        if _axis_angle_deg(axis_dir, od) > angle_deg:
+            continue
+        if _axis_distance(axis_point, axis_dir, op, od) > axis_dist:
+            continue
+        if abs(radius - orad) > max(radius_abs, radius_rel * radius):
+            continue
+        return idx
+    return None
+
+
+def run_session_mode(
+    pcd: o3d.geometry.PointCloud,
+    args,
+    profile: SensorProfile,
+    extra_config: dict,
+):
+    """Run workspace session mode for one-click extraction."""
+    print("\n" + "=" * 60)
+    print("  SESSION MODE")
+    print("=" * 60)
+    print("Controls after extraction:")
+    print("  [Enter] next seed | U undo | D delete last | S save | E export | Q quit")
+
+    all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+
+    if args.session_reset:
+        session = {"version": SESSION_RESULT_VERSION, "objects": []}
+        print("Session reset: starting from empty.")
+    else:
+        session = load_session(args.session_file)
+    meshes: List[o3d.geometry.TriangleMesh] = []
+    for obj in session.get("objects", []):
+        mesh = mesh_from_session_object(obj)
+        if mesh is not None:
+            meshes.append(mesh)
+
+    context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+    context_pcd = None
+    if args.show_context:
+        context_pcd = create_context_cloud(
+            pcd,
+            args.context_voxel,
+            center=None,
+            radius=context_radius,
+        )
+        if context_pcd is not None:
+            context_pcd = colorize_point_cloud_by_height(context_pcd)
+
+    rng = np.random.default_rng(1234)
+
+    def _apply_render_options(vis_obj):
+        opt = vis_obj.get_render_option()
+        if opt is not None:
+            opt.point_size = 2.0
+            opt.background_color = np.array([0.03, 0.03, 0.03])
+
+    def show_scene_for_pick():
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name="Session Pick (Shift+Click, close to confirm)")
+        _apply_render_options(vis)
+        pick_cloud = colorize_point_cloud_by_height(pcd)
+        vis.add_geometry(pick_cloud)
+        for mesh in meshes:
+            vis.add_geometry(mesh)
+        vis.run()
+        picked = vis.get_picked_points()
+        vis.destroy_window()
+        pick_points = np.asarray(pick_cloud.points)
+        if not picked:
+            return None
+        idx = picked[0]
+        if idx < 0 or idx >= len(pick_points):
+            return None
+        return pick_points[idx]
+
+    def show_scene():
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="Session Workspace")
+        _apply_render_options(vis)
+        if context_pcd is not None and not context_pcd.is_empty():
+            vis.add_geometry(context_pcd)
+        else:
+            base = colorize_point_cloud_by_height(pcd)
+            vis.add_geometry(base)
+        for mesh in meshes:
+            vis.add_geometry(mesh)
+        vis.run()
+        vis.destroy_window()
+
+    while True:
+        seed_center = show_scene_for_pick()
+        if seed_center is None:
+            print("No point selected. Exiting session.")
+            break
+
+        print(f"\nSeed: {np.round(seed_center, 4).tolist()}")
+
+        seed_indices, seed_radius = adaptive_seed_indices(
+            all_points,
+            seed_center,
+            seed_radius_start=args.seed_radius_start,
+            seed_radius_max=args.seed_radius_max,
+            seed_radius_step=args.seed_radius_step,
+            min_seed_points=args.min_seed_points,
+        )
+        print(f"  Seed radius used: {seed_radius:.3f} m ({len(seed_indices)} pts)")
+
+        plane_result = None
+        cylinder_result = None
+        plane_mesh = None
+        plane_metrics = None
+        plane_quality = {}
+        cylinder_quality = {}
+        cyl_proxy = None
+        plane_color = None
+
+        surface_th = profile.cylinder_distance_threshold
+
+        if args.force in ("auto", "plane"):
+            plane_result = expand_plane_from_seed(
+                all_points,
+                seed_center,
+                normals=all_normals,
+                seed_radius=seed_radius,
+                max_expand_radius=args.max_expand_radius,
+                grow_radius=args.grow_radius,
+                distance_threshold=profile.plane_distance_threshold,
+                normal_threshold_deg=args.normal_th,
+                expand_method=args.expand_method,
+                max_refine_iters=args.max_refine_iters,
+                adaptive_refine_threshold=args.adaptive_plane_refine_th,
+                adaptive_refine_k=args.adaptive_plane_refine_k,
+                adaptive_refine_min_scale=args.adaptive_plane_refine_min_scale,
+                adaptive_refine_max_scale=args.adaptive_plane_refine_max_scale,
+                max_expanded_points=args.max_expanded_points,
+                max_frontier=args.max_frontier,
+                max_steps=args.max_steps,
+                verbose=False,
+            )
+            if plane_result.success and plane_result.plane is not None:
+                plane_color = rng.uniform(0.2, 0.9, size=3)
+                plane_indices = plane_result.expanded_inlier_indices
+                if plane_indices is None and plane_result.plane.inlier_indices is not None:
+                    plane_indices = plane_result.plane.inlier_indices
+                if plane_indices is None:
+                    plane_indices = np.empty((0,), dtype=int)
+                plane_res_median, plane_res_mad = compute_plane_residual_stats(
+                    all_points[np.asarray(plane_indices, dtype=int)],
+                    plane_result.plane.point,
+                    plane_result.plane.normal,
+                )
+                plane_quality = {
+                    "inlier_count": int(plane_result.expanded_inlier_count),
+                    "residual_median": float(plane_res_median),
+                    "residual_mad": float(plane_res_mad),
+                    "area": float(plane_result.area),
+                    "extent_u": float(plane_result.extent_u),
+                    "extent_v": float(plane_result.extent_v),
+                    "tilt_deg": float(plane_tilt_deg(plane_result.plane.normal)),
+                    "stop_reason": str(plane_result.stop_reason),
+                }
+                try:
+                    plane_mesh, plane_metrics = create_plane_patch_mesh(
+                        plane_result.plane,
+                        all_points,
+                        plane_color,
+                        padding=0.02,
+                        patch_shape=args.patch_shape,
+                    )
+                except Exception as exc:
+                    plane_metrics = {
+                        "patch_shape": args.patch_shape,
+                        "corners_world": np.empty((0, 3), dtype=float),
+                        "patch_fallback_reason": str(exc),
+                        "area": float(plane_result.area),
+                        "extent_u": float(plane_result.extent_u),
+                        "extent_v": float(plane_result.extent_v),
+                    }
+            else:
+                if plane_result is not None:
+                    print(f"  Plane failed: {plane_result.message}")
+
+        if args.force in ("auto", "cylinder"):
+            proxy_init = compute_cylinder_proxy_from_seed(
+                all_points,
+                seed_center,
+                normals=all_normals,
+                seed_radius_start=args.seed_radius_start,
+                seed_radius_max=args.seed_radius_max,
+                seed_radius_step=args.seed_radius_step,
+                min_seed_points=args.min_seed_points,
+                circle_ransac_iters=200,
+                circle_inlier_threshold=surface_th,
+                length_margin=0.05,
+            )
+            if proxy_init.success and proxy_init.cylinder is not None:
+                cyl_proxy = proxy_init.cylinder
+                cylinder_result = finalize_cylinder_from_proxy(
+                    all_points,
+                    seed_center,
+                    proxy_init.seed_indices,
+                    cyl_proxy,
+                    surface_threshold=surface_th,
+                    cap_margin=0.05,
+                    grow_radius=args.grow_radius,
+                    max_expand_radius=args.max_expand_radius,
+                    max_expanded_points=args.max_expanded_points,
+                    max_frontier=args.max_frontier,
+                    max_steps=args.max_steps,
+                    normals=all_normals,
+                    normal_angle_threshold_deg=args.normal_th,
+                    refine_iters=min(3, max(1, int(args.max_refine_iters))),
+                    circle_ransac_iters=200,
+                    circle_inlier_threshold=surface_th,
+                    allow_length_growth=True,
+                    axis_regularization_weight=0.02,
+                    recompute_length_from_inliers=True,
+                )
+                if cylinder_result.success and cylinder_result.final is not None:
+                    cylinder_quality = {
+                        "inlier_count": int(cylinder_result.inlier_count),
+                        "residual_median": float(cylinder_result.residual_median),
+                        "residual_mad": float(cylinder_result.residual_mad),
+                        "stop_reason": str(cylinder_result.stop_reason),
+                        "candidate_count": int(cylinder_result.candidate_count),
+                    }
+                else:
+                    if cylinder_result is not None:
+                        print(f"  Cylinder failed: {cylinder_result.message}")
+            else:
+                print(f"  Cylinder proxy init failed: {proxy_init.message}")
+
+        chosen_type = args.force
+        plane_score = -1.0
+        cylinder_score = -1.0
+        if args.force == "auto":
+            select = auto_select_primitive(
+                plane_result,
+                cylinder_result,
+                plane_threshold=profile.plane_distance_threshold,
+                cylinder_threshold=profile.cylinder_distance_threshold,
+            )
+            chosen_type = select.chosen
+            plane_score = select.plane_score
+            cylinder_score = select.cylinder_score
+            print(
+                f"  Auto scores: plane={plane_score:.2f}, cylinder={cylinder_score:.2f} -> {chosen_type}"
+            )
+
+        if chosen_type == "none":
+            print("  No valid primitive found. Continuing.")
+            continue
+
+        if chosen_type == "plane":
+            if plane_result is None or not plane_result.success or plane_result.plane is None:
+                print("  Plane extraction failed. Continuing.")
+                continue
+            color = plane_color if plane_color is not None else rng.uniform(0.2, 0.9, size=3)
+            if plane_mesh is None and plane_metrics is not None:
+                plane_mesh = build_mesh_from_polygon(
+                    plane_metrics.get("corners_world", np.empty((0, 3))),
+                    color,
+                )
+            if plane_mesh is None:
+                print("  Plane mesh unavailable; skipping.")
+                continue
+            meshes.append(plane_mesh)
+
+            corners_world = None
+            if plane_metrics is not None and plane_metrics.get("corners_world") is not None:
+                corners_world = np.asarray(plane_metrics["corners_world"], dtype=float).tolist()
+
+            obj = {
+                "id": len(session["objects"]),
+                "type": "plane",
+                "seed": {
+                    "center": seed_center.tolist(),
+                    "radius": float(seed_radius),
+                    "point_count": int(len(seed_indices)),
+                },
+                "params": {
+                    "normal": plane_result.plane.normal.tolist(),
+                    "point": plane_result.plane.point.tolist(),
+                    "tilt_deg": float(plane_tilt_deg(plane_result.plane.normal)),
+                    "area": float(plane_result.area),
+                    "extent_u": float(plane_result.extent_u),
+                    "extent_v": float(plane_result.extent_v),
+                    "patch_shape": plane_metrics.get("patch_shape") if plane_metrics else None,
+                    "corners_world": corners_world,
+                    "patch_fallback_reason": plane_metrics.get("patch_fallback_reason") if plane_metrics else None,
+                },
+                "quality": {
+                    **plane_quality,
+                    "score": float(plane_score if args.force == "auto" else plane_quality.get("inlier_count", 0)),
+                },
+                "stop_reason": str(plane_result.stop_reason),
+                "color": color.tolist(),
+            }
+            session["objects"].append(obj)
+        elif chosen_type == "cylinder":
+            if cylinder_result is None or not cylinder_result.success or cylinder_result.final is None:
+                print("  Cylinder extraction failed. Continuing.")
+                continue
+            final = cylinder_result.final
+            axis_dir = unit_vector(final.axis_direction)
+            end0, end1 = cylinder_endpoints(final.axis_point, axis_dir, final.length)
+            color = rng.uniform(0.2, 0.9, size=3)
+            cyl_mesh = create_cylinder_mesh(
+                final.axis_point,
+                axis_dir,
+                final.radius,
+                final.length,
+                color,
+            )
+            obj = {
+                "id": len(session["objects"]),
+                "type": "cylinder",
+                "seed": {
+                    "center": seed_center.tolist(),
+                    "radius": float(seed_radius),
+                    "point_count": int(len(seed_indices)),
+                },
+                "params": {
+                    "axis_point": final.axis_point.tolist(),
+                    "axis_direction": axis_dir.tolist(),
+                    "radius": float(final.radius),
+                    "diameter": float(final.radius * 2.0),
+                    "length": float(final.length),
+                    "end_center_0": end0.tolist(),
+                    "end_center_1": end1.tolist(),
+                },
+                "quality": {
+                    **cylinder_quality,
+                    "score": float(cylinder_score if args.force == "auto" else cylinder_quality.get("inlier_count", 0)),
+                },
+                "stop_reason": str(cylinder_result.stop_reason),
+                "color": color.tolist(),
+            }
+            if cyl_proxy is not None:
+                proxy_axis = unit_vector(cyl_proxy.axis_direction)
+                p0, p1 = cylinder_endpoints(cyl_proxy.axis_point, proxy_axis, cyl_proxy.length)
+                obj["proxy"] = {
+                    "axis_point": cyl_proxy.axis_point.tolist(),
+                    "axis_direction": proxy_axis.tolist(),
+                    "radius": float(cyl_proxy.radius),
+                    "diameter": float(cyl_proxy.radius * 2.0),
+                    "length": float(cyl_proxy.length),
+                    "end_center_0": p0.tolist(),
+                    "end_center_1": p1.tolist(),
+                }
+            if args.session_dedup:
+                dup_idx = find_duplicate_cylinder(obj, session["objects"])
+            else:
+                dup_idx = None
+
+            if dup_idx is not None:
+                existing = session["objects"][dup_idx]
+                old_score = float(existing.get("quality", {}).get("score", 0.0))
+                new_score = float(obj.get("quality", {}).get("score", 0.0))
+                if new_score >= old_score:
+                    session["objects"][dup_idx] = obj
+                    if dup_idx < len(meshes):
+                        meshes[dup_idx] = cyl_mesh
+                    print("  Updated existing cylinder (dedup).")
+                else:
+                    print("  Skipped duplicate cylinder (existing better).")
+            else:
+                session["objects"].append(obj)
+                meshes.append(cyl_mesh)
+        else:
+            print("  Unknown selection, skipping.")
+            continue
+
+        show_scene()
+
+        while True:
+            cmd = input("\n[Enter] next | U undo | D delete | S save | E export | Q quit: ").strip().lower()
+            if cmd == "":
+                break
+            if cmd == "u" or cmd == "d":
+                if session["objects"]:
+                    session["objects"].pop()
+                    if meshes:
+                        meshes.pop()
+                    print("Undid last object.")
+                break
+            if cmd == "s":
+                save_session(args.session_file, session)
+                continue
+            if cmd == "e":
+                if args.export_all:
+                    combined = _combine_meshes(meshes)
+                    o3d.io.write_triangle_mesh(args.export_all, combined)
+                    print(f"Exported all meshes to {args.export_all}")
+                else:
+                    print("No --export-all specified.")
+                continue
+            if cmd == "q":
+                save_session(args.session_file, session)
+                return
+            print("Unknown command.")
+
+    save_session(args.session_file, session)
+
+
 def run_seed_expand_mode(
     pcd: o3d.geometry.PointCloud,
     args,
     profile: SensorProfile,
-    extra_config: dict
+    extra_config: dict,
+    initial_cylinder: Optional[CylinderParam] = None,
 ):
     """
     Run seed-expand mode: fit primitive on seed, then expand to connected region.
@@ -1980,6 +2957,13 @@ def run_seed_expand_mode(
     print(f"  Normal threshold: {args.normal_th}°")
     print(f"  Plane threshold: {profile.plane_distance_threshold}m")
     print(f"  Cylinder threshold: {profile.cylinder_distance_threshold}m")
+    if initial_cylinder is not None:
+        print(
+            "  Initial cylinder prior: axis_point="
+            f"{np.round(initial_cylinder.axis_point, 4).tolist()}, axis_dir="
+            f"{np.round(initial_cylinder.axis_direction, 4).tolist()}, "
+            f"radius={initial_cylinder.radius:.4f}, length={initial_cylinder.length:.3f}"
+        )
     print(
         "  Adaptive plane refine threshold: "
         f"{'on' if args.adaptive_plane_refine_th else 'off'}"
@@ -2071,6 +3055,13 @@ def run_seed_expand_mode(
         "adaptive_plane_refine_min_scale": args.adaptive_plane_refine_min_scale,
         "adaptive_plane_refine_max_scale": args.adaptive_plane_refine_max_scale,
     }
+    if initial_cylinder is not None:
+        seed_params["initial_cylinder"] = {
+            "axis_point": initial_cylinder.axis_point.tolist(),
+            "axis_direction": initial_cylinder.axis_direction.tolist(),
+            "radius": float(initial_cylinder.radius),
+            "length": float(initial_cylinder.length),
+        }
 
     if choice == 'p':
         # Plane seed-expand
@@ -2101,6 +3092,7 @@ def run_seed_expand_mode(
             print("Plane Seed-Expand Result:")
             print(f"  Normal: {np.round(result.plane.normal, 4).tolist()}")
             print(f"  Point: {np.round(result.plane.point, 4).tolist()}")
+            print(f"  Tilt: {plane_tilt_deg(result.plane.normal):.2f} deg")
             print(f"  Expanded inliers: {result.expanded_inlier_count}")
             print(f"  Area: {result.area:.3f} m²")
             print(f"  Extent: ({result.extent_u:.2f} x {result.extent_v:.2f}) m")
@@ -2115,6 +3107,11 @@ def run_seed_expand_mode(
                     patch_shape=args.patch_shape,
                 )
                 patch_shape_used = patch_metrics.get("patch_shape", args.patch_shape)
+                corners_world = patch_metrics.get("corners_world")
+                corners_array = None
+                if corners_world is not None:
+                    corners_array = np.asarray(corners_world, dtype=float)
+                corners_count = int(corners_array.shape[0]) if corners_array is not None and corners_array.ndim == 2 else 0
                 if patch_shape_used == "rect":
                     rect_u = float(patch_metrics.get("rect_extent_u", 0.0))
                     rect_v = float(patch_metrics.get("rect_extent_v", 0.0))
@@ -2128,10 +3125,23 @@ def run_seed_expand_mode(
                         f"  Patch: hull area={float(patch_metrics.get('area', 0.0)):.3f} m² "
                         f"hull_area={hull_area:.3f} m²"
                     )
+                if corners_array is not None and corners_array.ndim == 2 and corners_count > 0:
+                    rounded = np.round(corners_array, 4).tolist()
+                    print(f"  Patch corners_world ({corners_count}): {rounded}")
                 if patch_metrics.get("patch_fallback_reason"):
                     print(f"  Patch fallback: {patch_metrics['patch_fallback_reason']}")
             except Exception as exc:
-                print(f"  Warning: Could not create plane patch mesh: {exc}")
+                patch_metrics = {
+                    "patch_shape": args.patch_shape,
+                    "corners_world": np.empty((0, 3), dtype=float),
+                    "patch_fallback_reason": str(exc),
+                    "area": float(result.area),
+                    "extent_u": float(result.extent_u),
+                    "extent_v": float(result.extent_v),
+                }
+                print(f"  Patch fallback: {exc}")
+                print(f"  Patch shape: {args.patch_shape}")
+                print("  Patch corners_world (0): []")
 
             # Visualize
             visualize_seed_expand_plane(
@@ -2171,6 +3181,7 @@ def run_seed_expand_mode(
             all_points,
             seed_center,
             normals=all_normals,
+            initial_cylinder=initial_cylinder,
             seed_radius=args.seed_radius,
             max_expand_radius=args.max_expand_radius,
             grow_radius=args.grow_radius,
@@ -2187,11 +3198,28 @@ def run_seed_expand_mode(
         if result.success and result.cylinder is not None:
             print("\n" + "-" * 40)
             print("Cylinder Seed-Expand Result:")
+            axis_dir = unit_vector(result.cylinder.axis_direction)
+            end0, end1 = cylinder_endpoints(
+                result.cylinder.axis_point,
+                axis_dir,
+                result.cylinder.length,
+            )
             print(f"  Axis point: {np.round(result.cylinder.axis_point, 4).tolist()}")
-            print(f"  Axis direction: {np.round(result.cylinder.axis_direction, 4).tolist()}")
+            print(f"  Axis direction: {np.round(axis_dir, 4).tolist()}")
             print(f"  Radius: {result.cylinder.radius:.4f} m")
+            print(f"  Diameter: {result.cylinder.radius * 2.0:.4f} m")
             print(f"  Length: {result.cylinder.length:.3f} m")
-            print(f"  Expanded inliers: {result.expanded_inlier_count}")
+            print(f"  End center 0: {np.round(end0, 4).tolist()}")
+            print(f"  End center 1: {np.round(end1, 4).tolist()}")
+            print(
+                "  Residual median/MAD: "
+                f"{getattr(result, 'residual_median', 0.0):.4f}/"
+                f"{getattr(result, 'residual_mad', 0.0):.4f} m"
+            )
+            print(
+                f"  Inliers: {result.cylinder.inlier_count} "
+                f"(expanded={result.expanded_inlier_count})"
+            )
 
             # Visualize
             visualize_seed_expand_cylinder(
@@ -2222,6 +3250,527 @@ def run_seed_expand_mode(
     print("\n" + "=" * 60)
     print("  SEED-EXPAND MODE COMPLETE")
     print("=" * 60)
+
+
+def visualize_cylinder_probe_result(
+    pcd: o3d.geometry.PointCloud,
+    all_points: np.ndarray,
+    proxy: CylinderParam,
+    final: CylinderParam,
+    inlier_indices: Optional[np.ndarray],
+    *,
+    seed_center: np.ndarray,
+    context_pcd: Optional[o3d.geometry.PointCloud] = None,
+):
+    """Visualize cylinder probe with proxy and final meshes."""
+    geometries = []
+
+    if context_pcd is not None and not context_pcd.is_empty():
+        geometries.append(context_pcd)
+    else:
+        base = o3d.geometry.PointCloud(pcd)
+        base.paint_uniform_color([0.6, 0.6, 0.6])
+        geometries.append(base)
+
+    if inlier_indices is not None and len(inlier_indices) > 0:
+        inlier_pcd = o3d.geometry.PointCloud()
+        inlier_pcd.points = o3d.utility.Vector3dVector(all_points[inlier_indices])
+        inlier_pcd.paint_uniform_color([0.9, 0.2, 0.2])
+        geometries.append(inlier_pcd)
+
+    proxy_mesh = create_cylinder_mesh(
+        proxy.axis_point,
+        proxy.axis_direction,
+        proxy.radius,
+        proxy.length,
+        np.array([0.4, 0.7, 1.0]),
+    )
+    proxy_axis = create_axis_line(
+        proxy.axis_point,
+        proxy.axis_direction,
+        proxy.length,
+        np.array([0.4, 0.7, 1.0]),
+    )
+    geometries.extend([proxy_mesh, proxy_axis])
+
+    final_mesh = create_cylinder_mesh(
+        final.axis_point,
+        final.axis_direction,
+        final.radius,
+        final.length,
+        np.array([0.0, 0.0, 0.8]),
+    )
+    final_axis = create_axis_line(
+        final.axis_point,
+        final.axis_direction,
+        final.length,
+        np.array([1.0, 1.0, 0.0]),
+    )
+    geometries.extend([final_mesh, final_axis])
+
+    seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    seed_marker.translate(seed_center)
+    seed_marker.paint_uniform_color([1.0, 1.0, 0.0])
+    seed_marker.compute_vertex_normals()
+    geometries.append(seed_marker)
+
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name="Cylinder Probe Result",
+    )
+
+
+def run_cylinder_probe_mode(
+    pcd: o3d.geometry.PointCloud,
+    args,
+    profile: SensorProfile,
+    extra_config: dict,
+):
+    """
+    Run interactive cylinder probe mode.
+    """
+    print("\n" + "=" * 60)
+    print("  CYLINDER PROBE MODE")
+    print("=" * 60)
+    surface_th = (
+        args.cyl_probe_surface_th
+        if args.cyl_probe_surface_th is not None
+        else profile.cylinder_distance_threshold
+    )
+    print("Parameters:")
+    print(f"  Seed radius start/max/step: {args.cyl_probe_seed_start}/{args.cyl_probe_seed_max}/{args.cyl_probe_seed_step} m")
+    print(f"  Min seed points: {args.cyl_probe_min_seed_points}")
+    print(f"  Surface threshold: {surface_th} m")
+    print(f"  Cap margin: {args.cyl_probe_cap_margin} m")
+    print(f"  Refine iters: {args.cyl_probe_refine_iters}")
+    print(f"  Axis refit: {'ON' if args.cyl_probe_axis_refit else 'OFF'}")
+    print("  Length growth: ON")
+    print(f"  Grow radius: {args.grow_radius} m")
+    print(f"  Max expand radius: {args.max_expand_radius} m")
+
+    # Get all points
+    all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+
+    # Show point cloud first
+    print("\n=== Point Cloud Viewer ===")
+    print("Shift + Left Click to pick a cylinder surface point")
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window(window_name="Point Cloud (Cylinder Probe)")
+    vis.add_geometry(pcd)
+    vis.run()
+    picked_indices = vis.get_picked_points()
+    vis.destroy_window()
+
+    if not picked_indices:
+        print("No point selected, cancelling cylinder probe.")
+        return
+
+    seed_idx = picked_indices[0]
+    seed_center = all_points[seed_idx]
+    print(f"Selected seed point: {np.round(seed_center, 4).tolist()}")
+
+    context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+    context_pcd = None
+    if args.show_context:
+        context_center = seed_center if context_radius is not None else None
+        context_pcd = create_context_cloud(
+            pcd,
+            args.context_voxel,
+            center=context_center,
+            radius=context_radius,
+        )
+        if context_pcd is None:
+            print("Context cloud is empty; using full cloud.")
+
+    proxy_init = compute_cylinder_proxy_from_seed(
+        all_points,
+        seed_center,
+        normals=all_normals,
+        seed_radius_start=args.cyl_probe_seed_start,
+        seed_radius_max=args.cyl_probe_seed_max,
+        seed_radius_step=args.cyl_probe_seed_step,
+        min_seed_points=args.cyl_probe_min_seed_points,
+        circle_ransac_iters=200,
+        circle_inlier_threshold=surface_th,
+        length_margin=0.05,
+    )
+    if not proxy_init.success or proxy_init.cylinder is None:
+        print(f"Cylinder probe init failed: {proxy_init.message}")
+        return
+
+    proxy = proxy_init.cylinder
+    axis_dir_pca = unit_vector(proxy_init.axis_dir_pca) if proxy_init.axis_dir_pca is not None else unit_vector(proxy.axis_direction)
+    print("Initial proxy cylinder:")
+    print(f"  Axis point: {np.round(proxy.axis_point, 4).tolist()}")
+    print(f"  Axis direction: {np.round(proxy.axis_direction, 4).tolist()}")
+    print(f"  Radius: {proxy.radius:.4f} m")
+    print(f"  Length: {proxy.length:.3f} m")
+    print(f"  Seed radius used: {proxy_init.seed_radius:.3f} m ({proxy_init.seed_point_count} pts)")
+
+    help_text = (
+        "Keys: [/] radius, -/= length, WASD move, R/F axis move, "
+        "arrows rotate, X reset, V snap Z, Enter confirm, Esc cancel"
+    )
+    print("\nCylinder Probe Controls:")
+    print(f"  {help_text}")
+
+    class ProbeState:
+        def __init__(self, cylinder: CylinderParam, axis_dir_reset: np.ndarray):
+            self.axis_point = np.asarray(cylinder.axis_point, dtype=float)
+            self.axis_dir = unit_vector(cylinder.axis_direction)
+            self.radius = float(cylinder.radius)
+            self.length = float(cylinder.length)
+            self.axis_dir_reset = unit_vector(axis_dir_reset)
+            self.snap_z = False
+            self.axis_dir_before_snap = self.axis_dir.copy()
+            self.confirmed = False
+            self.cancelled = False
+            self.ops = {
+                "radius_adjust": 0,
+                "length_adjust": 0,
+                "move_perp": 0,
+                "move_axis": 0,
+                "rotate": 0,
+                "reset_axis": 0,
+                "snap_toggle": 0,
+            }
+
+        def ensure_snap_off(self):
+            if self.snap_z:
+                self.snap_z = False
+                self.axis_dir_before_snap = self.axis_dir.copy()
+                self.ops["snap_toggle"] += 1
+
+    state = ProbeState(proxy, axis_dir_pca)
+
+    radius_step = 0.002
+    length_step = 0.05
+    move_step = 0.02
+    axis_step = 0.02
+    rot_step = 2.0
+
+    proxy_mesh = create_cylinder_mesh(
+        state.axis_point,
+        state.axis_dir,
+        state.radius,
+        state.length,
+        np.array([0.4, 0.7, 1.0]),
+    )
+    proxy_axis = create_axis_line(
+        state.axis_point,
+        state.axis_dir,
+        state.length,
+        np.array([0.4, 0.7, 1.0]),
+    )
+
+    seed_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    seed_marker.translate(seed_center)
+    seed_marker.paint_uniform_color([1.0, 1.0, 0.0])
+    seed_marker.compute_vertex_normals()
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name=f"Cylinder Probe ({help_text})")
+    if context_pcd is not None and not context_pcd.is_empty():
+        vis.add_geometry(context_pcd)
+    else:
+        base = o3d.geometry.PointCloud(pcd)
+        base.paint_uniform_color([0.6, 0.6, 0.6])
+        vis.add_geometry(base)
+    vis.add_geometry(proxy_mesh)
+    vis.add_geometry(proxy_axis)
+    vis.add_geometry(seed_marker)
+
+    def refresh_geometry():
+        new_mesh = create_cylinder_mesh(
+            state.axis_point,
+            state.axis_dir,
+            state.radius,
+            state.length,
+            np.array([0.4, 0.7, 1.0]),
+        )
+        proxy_mesh.vertices = new_mesh.vertices
+        proxy_mesh.triangles = new_mesh.triangles
+        proxy_mesh.vertex_colors = new_mesh.vertex_colors
+        proxy_mesh.compute_vertex_normals()
+
+        new_axis = create_axis_line(
+            state.axis_point,
+            state.axis_dir,
+            state.length,
+            np.array([0.4, 0.7, 1.0]),
+        )
+        proxy_axis.points = new_axis.points
+        proxy_axis.lines = new_axis.lines
+        proxy_axis.colors = new_axis.colors
+
+        vis.update_geometry(proxy_mesh)
+        vis.update_geometry(proxy_axis)
+
+    def close_window():
+        try:
+            vis.close()
+        except Exception:
+            vis.destroy_window()
+
+    def on_radius_minus(vis_obj):
+        state.radius = max(state.radius - radius_step, 0.001)
+        state.ops["radius_adjust"] += 1
+        refresh_geometry()
+        return True
+
+    def on_radius_plus(vis_obj):
+        state.radius = max(state.radius + radius_step, 0.001)
+        state.ops["radius_adjust"] += 1
+        refresh_geometry()
+        return True
+
+    def on_length_minus(vis_obj):
+        state.length = max(state.length - length_step, 0.02)
+        state.ops["length_adjust"] += 1
+        refresh_geometry()
+        return True
+
+    def on_length_plus(vis_obj):
+        state.length = max(state.length + length_step, 0.02)
+        state.ops["length_adjust"] += 1
+        refresh_geometry()
+        return True
+
+    def move_perp(dx, dy):
+        u, v = _plane_basis_from_normal(state.axis_dir)
+        state.axis_point = state.axis_point + u * dx + v * dy
+        state.ops["move_perp"] += 1
+        refresh_geometry()
+
+    def move_axis(dt):
+        state.axis_point = state.axis_point + state.axis_dir * dt
+        state.ops["move_axis"] += 1
+        refresh_geometry()
+
+    def rotate_axis(rot_axis, angle_deg):
+        state.ensure_snap_off()
+        state.axis_dir = unit_vector(rotate_vector(state.axis_dir, rot_axis, angle_deg))
+        state.ops["rotate"] += 1
+        refresh_geometry()
+
+    def on_w(vis_obj):
+        move_perp(0.0, move_step)
+        return True
+
+    def on_s(vis_obj):
+        move_perp(0.0, -move_step)
+        return True
+
+    def on_a(vis_obj):
+        move_perp(-move_step, 0.0)
+        return True
+
+    def on_d(vis_obj):
+        move_perp(move_step, 0.0)
+        return True
+
+    def on_r(vis_obj):
+        move_axis(axis_step)
+        return True
+
+    def on_f(vis_obj):
+        move_axis(-axis_step)
+        return True
+
+    def on_up(vis_obj):
+        u, _ = _plane_basis_from_normal(state.axis_dir)
+        rotate_axis(u, rot_step)
+        return True
+
+    def on_down(vis_obj):
+        u, _ = _plane_basis_from_normal(state.axis_dir)
+        rotate_axis(u, -rot_step)
+        return True
+
+    def on_left(vis_obj):
+        _, v = _plane_basis_from_normal(state.axis_dir)
+        rotate_axis(v, rot_step)
+        return True
+
+    def on_right(vis_obj):
+        _, v = _plane_basis_from_normal(state.axis_dir)
+        rotate_axis(v, -rot_step)
+        return True
+
+    def on_reset_axis(vis_obj):
+        state.axis_dir = unit_vector(state.axis_dir_reset)
+        state.snap_z = False
+        state.ops["reset_axis"] += 1
+        refresh_geometry()
+        return True
+
+    def on_snap_z(vis_obj):
+        if not state.snap_z:
+            state.axis_dir_before_snap = state.axis_dir.copy()
+            state.axis_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+            state.snap_z = True
+        else:
+            state.axis_dir = state.axis_dir_before_snap.copy()
+            state.snap_z = False
+        state.ops["snap_toggle"] += 1
+        refresh_geometry()
+        return True
+
+    def on_confirm(vis_obj):
+        state.confirmed = True
+        close_window()
+        return True
+
+    def on_cancel(vis_obj):
+        state.cancelled = True
+        close_window()
+        return True
+
+    vis.register_key_callback(ord("["), on_radius_minus)
+    vis.register_key_callback(ord("]"), on_radius_plus)
+    vis.register_key_callback(ord("-"), on_length_minus)
+    vis.register_key_callback(ord("="), on_length_plus)
+    vis.register_key_callback(ord("W"), on_w)
+    vis.register_key_callback(ord("S"), on_s)
+    vis.register_key_callback(ord("A"), on_a)
+    vis.register_key_callback(ord("D"), on_d)
+    vis.register_key_callback(ord("R"), on_r)
+    vis.register_key_callback(ord("F"), on_f)
+    vis.register_key_callback(ord("X"), on_reset_axis)
+    vis.register_key_callback(ord("V"), on_snap_z)
+    vis.register_key_callback(265, on_up)    # GLFW_KEY_UP
+    vis.register_key_callback(264, on_down)  # GLFW_KEY_DOWN
+    vis.register_key_callback(263, on_left)  # GLFW_KEY_LEFT
+    vis.register_key_callback(262, on_right) # GLFW_KEY_RIGHT
+    vis.register_key_callback(257, on_confirm)  # GLFW_KEY_ENTER
+    vis.register_key_callback(256, on_cancel)   # GLFW_KEY_ESCAPE
+
+    vis.run()
+    vis.destroy_window()
+
+    if state.cancelled or not state.confirmed:
+        print("Cylinder probe cancelled.")
+        return
+
+    proxy_final = CylinderParam(
+        axis_point=state.axis_point,
+        axis_direction=state.axis_dir,
+        radius=float(state.radius),
+        length=float(state.length),
+        inlier_count=0,
+        inlier_indices=None,
+    )
+
+    result = finalize_cylinder_from_proxy(
+        all_points,
+        seed_center,
+        proxy_init.seed_indices,
+        proxy_final,
+        surface_threshold=surface_th,
+        cap_margin=args.cyl_probe_cap_margin,
+        grow_radius=args.grow_radius,
+        max_expand_radius=args.max_expand_radius,
+        max_expanded_points=args.max_expanded_points,
+        max_frontier=args.max_frontier,
+        max_steps=args.max_steps,
+        normals=all_normals,
+        normal_angle_threshold_deg=args.normal_th,
+        refine_iters=args.cyl_probe_refine_iters,
+        circle_ransac_iters=200,
+        circle_inlier_threshold=surface_th,
+        allow_length_growth=True,
+        allow_axis_refit=args.cyl_probe_axis_refit,
+        axis_snap_to_vertical_deg=args.cyl_probe_axis_snap_deg,
+        axis_regularization_weight=args.cyl_probe_axis_reg_weight,
+        recompute_length_from_inliers=not args.cyl_probe_no_recompute_length,
+    )
+
+    if args.cyl_probe_diagnostics_dir and result.success:
+        from primitives import export_cylinder_diagnostics_ply
+        diag_files = export_cylinder_diagnostics_ply(
+            all_points,
+            args.cyl_probe_diagnostics_dir,
+            prefix="cyl_probe",
+            seed_indices=proxy_init.seed_indices,
+            inlier_indices=result.inlier_indices,
+            cylinder=result.final,
+        )
+        print(f"  Diagnostics exported: {len(diag_files)} files to {args.cyl_probe_diagnostics_dir}")
+
+    if not result.success or result.final is None:
+        print(f"Cylinder probe failed: {result.message}")
+        return
+
+    final = result.final
+    final_axis = unit_vector(final.axis_direction)
+    end0, end1 = cylinder_endpoints(final.axis_point, final_axis, final.length)
+
+    print("\n" + "-" * 40)
+    print("Cylinder Probe Result:")
+    print(f"  Proxy axis point: {np.round(proxy_final.axis_point, 4).tolist()}")
+    print(f"  Proxy axis dir: {np.round(unit_vector(proxy_final.axis_direction), 4).tolist()}")
+    print(f"  Proxy radius/length: {proxy_final.radius:.4f} m / {proxy_final.length:.3f} m")
+    print(f"  Final axis point: {np.round(final.axis_point, 4).tolist()}")
+    print(f"  Final axis dir: {np.round(final_axis, 4).tolist()}")
+    print(f"  Final radius/diameter: {final.radius:.4f} / {final.radius * 2.0:.4f} m")
+    print(f"  Final length: {final.length:.3f} m")
+    print(f"  End centers: {np.round(end0, 4).tolist()} -> {np.round(end1, 4).tolist()}")
+    print(
+        f"  Residual median/MAD: {result.residual_median:.4f}/{result.residual_mad:.4f} m"
+    )
+    print(
+        f"  Inliers: {final.inlier_count} (candidates={result.candidate_count})"
+    )
+    if result.stopped_early:
+        print(f"  WARNING: expansion stopped early ({result.stop_reason})")
+
+    visualize_cylinder_probe_result(
+        pcd,
+        all_points,
+        proxy_final,
+        final,
+        result.inlier_indices,
+        seed_center=seed_center,
+        context_pcd=context_pcd,
+    )
+
+    params = {
+        "seed_radius_start": args.cyl_probe_seed_start,
+        "seed_radius_max": args.cyl_probe_seed_max,
+        "seed_radius_step": args.cyl_probe_seed_step,
+        "min_seed_points": args.cyl_probe_min_seed_points,
+        "seed_radius_used": float(proxy_init.seed_radius),
+        "seed_point_count": int(proxy_init.seed_point_count),
+        "surface_threshold": float(surface_th),
+        "cap_margin": float(args.cyl_probe_cap_margin),
+        "grow_radius": float(args.grow_radius),
+        "max_expand_radius": float(args.max_expand_radius),
+        "max_expanded_points": int(args.max_expanded_points),
+        "max_frontier": int(args.max_frontier),
+        "max_steps": int(args.max_steps),
+        "refine_iters": int(args.cyl_probe_refine_iters),
+    }
+    save_cylinder_probe_result(
+        result,
+        proxy_final,
+        final,
+        args.cyl_probe_output,
+        seed_center,
+        params,
+        state.ops,
+    )
+
+    if args.export_mesh:
+        mesh = create_cylinder_mesh(
+            final.axis_point,
+            final.axis_direction,
+            final.radius,
+            final.length,
+            np.array([0.0, 0.0, 0.8]),
+        )
+        o3d.io.write_triangle_mesh(args.export_mesh, mesh)
+        print(f"Exported cylinder mesh to {args.export_mesh}")
 
 
 def run_stairs_mode(
@@ -2380,6 +3929,11 @@ def run_stairs_mode(
 def main():
     """Main entry point."""
     args = parse_args()
+    try:
+        initial_cylinder = resolve_initial_cylinder(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(2)
 
     # Build effective configuration from profile and CLI overrides
     profile, extra_config = build_effective_config(args)
@@ -2396,15 +3950,34 @@ def main():
         print("\nPreprocessing point cloud...")
         pcd = preprocess_point_cloud(pcd, voxel_size=profile.voxel_size)
 
+    if args.cyl_probe and args.seed_expand:
+        print("Error: --cyl-probe and --seed-expand cannot be used together.")
+        sys.exit(2)
+    if args.session_mode and (args.cyl_probe or args.seed_expand or args.stairs_mode):
+        print("Error: --session cannot be combined with other modes.")
+        sys.exit(2)
+
+    if args.session_mode:
+        run_session_mode(pcd, args, profile, extra_config)
+        return
+
+    # Cylinder probe mode
+    if args.cyl_probe:
+        run_cylinder_probe_mode(pcd, args, profile, extra_config)
+        return
+
     # Check if seed-expand mode
     if args.seed_expand:
-        run_seed_expand_mode(pcd, args, profile, extra_config)
+        run_seed_expand_mode(pcd, args, profile, extra_config, initial_cylinder=initial_cylinder)
         return
 
     # Check if stairs mode
     if args.stairs_mode:
         run_stairs_mode(pcd, args, profile, extra_config)
         return
+
+    all_points = np.asarray(pcd.points)
+    all_normals = np.asarray(pcd.normals) if pcd.has_normals() else None
 
     # Load existing results
     results = load_results(args.output)
@@ -2433,6 +4006,8 @@ def main():
             if roi_pcd is None or roi_pcd.is_empty():
                 print("ROI selection cancelled or empty")
                 continue
+            roi_center = roi_selector.last_center
+            roi_radius_used = profile.r_min
         else:
             # Adaptive radius mode
             roi_result = roi_selector.select_roi_adaptive(
@@ -2456,49 +4031,170 @@ def main():
                     print("Skipping fitting for this ROI.")
                     continue
 
-        # Get points and normals from ROI
-        points = np.asarray(roi_pcd.points)
-        normals = np.asarray(roi_pcd.normals) if roi_pcd.has_normals() else None
+            roi_center = roi_result.center
+            roi_radius_used = roi_result.final_radius
+
+        if roi_center is None:
+            roi_points = np.asarray(roi_pcd.points)
+            if roi_points.size == 0:
+                print("ROI has no points; skipping.")
+                continue
+            roi_center = np.mean(roi_points, axis=0)
+
+        seed_radius = roi_radius_used if roi_radius_used and roi_radius_used > 0 else args.seed_radius
+
+        context_radius = args.context_radius if args.context_radius and args.context_radius > 0.0 else None
+        context_pcd = None
+        if args.show_context:
+            context_center = roi_center if context_radius is not None else None
+            context_pcd = create_context_cloud(
+                pcd,
+                args.context_voxel,
+                center=context_center,
+                radius=context_radius,
+            )
+            if context_pcd is None:
+                print(
+                    "Context cloud is empty after downsampling/radius filter; "
+                    "visualization will fall back to the original cloud."
+                )
 
         # Fit primitive
         if primitive_type == 'p':
-            print("\nFitting plane...")
-            plane = fit_plane(
-                points,
-                distance_threshold=profile.plane_distance_threshold
+            print("\nExpanding plane from seed...")
+            result = expand_plane_from_seed(
+                all_points,
+                roi_center,
+                normals=all_normals,
+                seed_radius=seed_radius,
+                max_expand_radius=args.max_expand_radius,
+                grow_radius=args.grow_radius,
+                distance_threshold=profile.plane_distance_threshold,
+                normal_threshold_deg=args.normal_th,
+                expand_method=args.expand_method,
+                max_refine_iters=args.max_refine_iters,
+                adaptive_refine_threshold=args.adaptive_plane_refine_th,
+                adaptive_refine_k=args.adaptive_plane_refine_k,
+                adaptive_refine_min_scale=args.adaptive_plane_refine_min_scale,
+                adaptive_refine_max_scale=args.adaptive_plane_refine_max_scale,
+                max_expanded_points=args.max_expanded_points,
+                max_frontier=args.max_frontier,
+                max_steps=args.max_steps,
+                verbose=True
             )
-            if plane is not None:
+
+            if result.success and result.plane is not None:
                 print(
-                    "Plane fit OK | normal="
-                    f"{np.round(plane.normal, 4).tolist()}, point="
-                    f"{np.round(plane.point, 4).tolist()}, inliers={plane.inlier_count}"
+                    "Plane expansion OK | normal="
+                    f"{np.round(result.plane.normal, 4).tolist()}, point="
+                    f"{np.round(result.plane.point, 4).tolist()}, "
+                    f"tilt={plane_tilt_deg(result.plane.normal):.2f}deg, "
+                    f"inliers={result.expanded_inlier_count}, "
+                    f"area={result.area:.3f}m^2, "
+                    f"extent=({result.extent_u:.2f} x {result.extent_v:.2f})m"
                 )
-                visualize_plane_fit(pcd, plane, roi_pcd)
-                results = append_plane_result(results, plane)
+                patch_mesh = None
+                patch_metrics = None
+                try:
+                    patch_mesh, patch_metrics = create_plane_patch_mesh(
+                        result.plane,
+                        all_points,
+                        np.array([0.0, 0.8, 0.0]),
+                        padding=0.02,
+                        patch_shape=args.patch_shape,
+                    )
+                    if patch_metrics is not None:
+                        patch_shape_used = patch_metrics.get("patch_shape", args.patch_shape)
+                        corners_world = patch_metrics.get("corners_world")
+                        corners_array = None
+                        if corners_world is not None:
+                            corners_array = np.asarray(corners_world, dtype=float)
+                        corners_count = int(corners_array.shape[0]) if corners_array is not None and corners_array.ndim == 2 else 0
+                        print(f"  Patch shape: {patch_shape_used}")
+                        if corners_array is not None and corners_array.ndim == 2 and corners_count > 0:
+                            rounded = np.round(corners_array, 4).tolist()
+                            print(f"  Patch corners_world ({corners_count}): {rounded}")
+                        if patch_metrics.get("patch_fallback_reason"):
+                            print(f"  Patch fallback: {patch_metrics['patch_fallback_reason']}")
+                except Exception as exc:
+                    patch_metrics = {
+                        "patch_shape": args.patch_shape,
+                        "corners_world": np.empty((0, 3), dtype=float),
+                        "patch_fallback_reason": str(exc),
+                        "area": float(result.area),
+                        "extent_u": float(result.extent_u),
+                        "extent_v": float(result.extent_v),
+                    }
+                    print(f"  Patch fallback: {exc}")
+                    print(f"  Patch shape: {args.patch_shape}")
+                    print("  Patch corners_world (0): []")
+
+                visualize_seed_expand_plane(
+                    pcd,
+                    result,
+                    roi_center,
+                    all_points,
+                    patch_mesh=patch_mesh,
+                    patch_shape=args.patch_shape,
+                    context_pcd=context_pcd,
+                    roi_radius=seed_radius,
+                )
+                results = append_plane_result(results, result.plane)
                 save_results(results, args.output)
             else:
-                print("Plane fitting failed")
+                print(f"Plane expansion failed: {result.message}")
 
         elif primitive_type == 'c':
-            print("\nFitting cylinder...")
-            cylinder = fit_cylinder(
-                points,
-                normals,
-                distance_threshold=profile.cylinder_distance_threshold
+            print("\nExpanding cylinder from seed...")
+            result = expand_cylinder_from_seed(
+                all_points,
+                roi_center,
+                normals=all_normals,
+                initial_cylinder=initial_cylinder,
+                seed_radius=seed_radius,
+                max_expand_radius=args.max_expand_radius,
+                grow_radius=args.grow_radius,
+                distance_threshold=profile.cylinder_distance_threshold,
+                normal_threshold_deg=args.normal_th,
+                expand_method=args.expand_method,
+                max_refine_iters=args.max_refine_iters,
+                max_expanded_points=args.max_expanded_points,
+                max_frontier=args.max_frontier,
+                max_steps=args.max_steps,
+                verbose=True
             )
-            if cylinder is not None:
-                print(
-                    "Cylinder fit OK | axis_point="
-                    f"{np.round(cylinder.axis_point, 4).tolist()}, axis_dir="
-                    f"{np.round(cylinder.axis_direction, 4).tolist()}, radius="
-                    f"{cylinder.radius:.4f}, length={cylinder.length:.4f}, "
-                    f"inliers={cylinder.inlier_count}"
+
+            if result.success and result.cylinder is not None:
+                axis_dir = unit_vector(result.cylinder.axis_direction)
+                end0, end1 = cylinder_endpoints(
+                    result.cylinder.axis_point,
+                    axis_dir,
+                    result.cylinder.length,
                 )
-                visualize_cylinder_fit(pcd, cylinder, roi_pcd)
-                results = append_cylinder_result(results, cylinder)
+                print(
+                    "Cylinder expansion OK | axis_point="
+                    f"{np.round(result.cylinder.axis_point, 4).tolist()}, axis_dir="
+                    f"{np.round(axis_dir, 4).tolist()}, radius="
+                    f"{result.cylinder.radius:.4f}, diameter={result.cylinder.radius * 2.0:.4f}, "
+                    f"length={result.cylinder.length:.4f}, "
+                    f"end0={np.round(end0, 4).tolist()}, end1={np.round(end1, 4).tolist()}, "
+                    f"residual_median/MAD={getattr(result, 'residual_median', 0.0):.4f}/"
+                    f"{getattr(result, 'residual_mad', 0.0):.4f}, "
+                    f"inliers={result.cylinder.inlier_count} "
+                    f"(expanded={result.expanded_inlier_count})"
+                )
+                visualize_seed_expand_cylinder(
+                    pcd,
+                    result,
+                    roi_center,
+                    all_points,
+                    context_pcd=context_pcd,
+                    roi_radius=seed_radius,
+                )
+                results = append_cylinder_result(results, result.cylinder)
                 save_results(results, args.output)
             else:
-                print("Cylinder fitting failed")
+                print(f"Cylinder expansion failed: {result.message}")
 
         # Ask if user wants to continue
         cont = input("\nFit another primitive? [y/n]: ").strip().lower()
