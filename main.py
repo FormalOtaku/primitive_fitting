@@ -1702,10 +1702,43 @@ def parse_args():
         help="Refinement iterations for probe (default: 2)"
     )
     probe_group.add_argument(
+        "--cyl-probe-axis-refit",
+        action="store_true",
+        dest="cyl_probe_axis_refit",
+        help="Allow axis direction refit during probe finalization (default: off, keeps proxy/user axis)"
+    )
+    probe_group.add_argument(
         "--cyl-probe-output",
         type=str,
         default="cyl_probe_results.json",
         help="Output JSON file for cylinder probe results (default: cyl_probe_results.json)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-axis-snap-deg",
+        type=float,
+        default=0.0,
+        dest="cyl_probe_axis_snap_deg",
+        help="Snap axis to vertical if within N degrees (default: 0 = disabled)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-axis-reg-weight",
+        type=float,
+        default=0.02,
+        dest="cyl_probe_axis_reg_weight",
+        help="Axis regularization weight (penalize deviation from reference, default: 0.02)"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-no-recompute-length",
+        action="store_true",
+        dest="cyl_probe_no_recompute_length",
+        help="Disable length recomputation from final inliers"
+    )
+    probe_group.add_argument(
+        "--cyl-probe-diagnostics-dir",
+        type=str,
+        default=None,
+        dest="cyl_probe_diagnostics_dir",
+        help="Directory to export debug PLY files (seed, candidates, inliers)"
     )
 
     # Cylinder prior options
@@ -2709,6 +2742,8 @@ def run_session_mode(
                     circle_ransac_iters=200,
                     circle_inlier_threshold=surface_th,
                     allow_length_growth=True,
+                    axis_regularization_weight=0.02,
+                    recompute_length_from_inliers=True,
                 )
                 if cylinder_result.success and cylinder_result.final is not None:
                     cylinder_quality = {
@@ -3308,6 +3343,8 @@ def run_cylinder_probe_mode(
     print(f"  Surface threshold: {surface_th} m")
     print(f"  Cap margin: {args.cyl_probe_cap_margin} m")
     print(f"  Refine iters: {args.cyl_probe_refine_iters}")
+    print(f"  Axis refit: {'ON' if args.cyl_probe_axis_refit else 'OFF'}")
+    print("  Length growth: ON")
     print(f"  Grow radius: {args.grow_radius} m")
     print(f"  Max expand radius: {args.max_expand_radius} m")
 
@@ -3642,7 +3679,24 @@ def run_cylinder_probe_mode(
         refine_iters=args.cyl_probe_refine_iters,
         circle_ransac_iters=200,
         circle_inlier_threshold=surface_th,
+        allow_length_growth=True,
+        allow_axis_refit=args.cyl_probe_axis_refit,
+        axis_snap_to_vertical_deg=args.cyl_probe_axis_snap_deg,
+        axis_regularization_weight=args.cyl_probe_axis_reg_weight,
+        recompute_length_from_inliers=not args.cyl_probe_no_recompute_length,
     )
+
+    if args.cyl_probe_diagnostics_dir and result.success:
+        from primitives import export_cylinder_diagnostics_ply
+        diag_files = export_cylinder_diagnostics_ply(
+            all_points,
+            args.cyl_probe_diagnostics_dir,
+            prefix="cyl_probe",
+            seed_indices=proxy_init.seed_indices,
+            inlier_indices=result.inlier_indices,
+            cylinder=result.final,
+        )
+        print(f"  Diagnostics exported: {len(diag_files)} files to {args.cyl_probe_diagnostics_dir}")
 
     if not result.success or result.final is None:
         print(f"Cylinder probe failed: {result.message}")
