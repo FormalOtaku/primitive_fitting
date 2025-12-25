@@ -68,6 +68,26 @@ SENSOR_PROFILES: Dict[str, SensorProfile] = {
     ),
 }
 
+PROFILE_CUSTOM_LABEL = "カスタム"
+PROFILE_LABELS: Dict[str, str] = {
+    "mid70_map": "mid70_map（Livox Mid-70/マップ）",
+    "velodyne_map": "velodyne_map（Velodyne/マップ）",
+    "mid70_stairs": "mid70_stairs（Livox Mid-70/階段）",
+}
+
+MODE_PLANE = "平面"
+MODE_CYLINDER = "円柱"
+MODE_STAIRS = "階段"
+
+EXPAND_METHOD_LABELS: Dict[str, str] = {
+    "component": "連結成分",
+    "bfs": "BFS",
+}
+PATCH_SHAPE_LABELS: Dict[str, str] = {
+    "hull": "凸包",
+    "rect": "矩形",
+}
+
 
 # =============================================================================
 # Geometry helpers (subset copied from main.py to avoid import cycles)
@@ -449,6 +469,35 @@ def save_stairs_results(
         json.dump(result, f, indent=2)
 
 
+def _profile_display(key: str) -> str:
+    return PROFILE_LABELS.get(key, key)
+
+
+def _profile_key_from_display(text: str) -> Optional[str]:
+    if text == PROFILE_CUSTOM_LABEL:
+        return None
+    for key, label in PROFILE_LABELS.items():
+        if text == label:
+            return key
+    if text in SENSOR_PROFILES:
+        return text
+    return None
+
+
+def _expand_method_value(text: str) -> str:
+    for key, label in EXPAND_METHOD_LABELS.items():
+        if text == label:
+            return key
+    return text if text in EXPAND_METHOD_LABELS else "component"
+
+
+def _patch_shape_value(text: str) -> str:
+    for key, label in PATCH_SHAPE_LABELS.items():
+        if text == label:
+            return key
+    return text if text in PATCH_SHAPE_LABELS else "hull"
+
+
 # =============================================================================
 # Point cloud I/O
 # =============================================================================
@@ -456,7 +505,7 @@ def save_stairs_results(
 def load_point_cloud(filepath: str) -> o3d.geometry.PointCloud:
     pcd = o3d.io.read_point_cloud(filepath)
     if pcd.is_empty():
-        raise ValueError(f"Failed to load point cloud from {filepath}")
+        raise ValueError(f"点群の読み込みに失敗しました: {filepath}")
     return pcd
 
 
@@ -494,7 +543,7 @@ class PrimitiveFittingApp:
         stairs_output_path: str = "stairs_results.json",
     ):
         self._app = gui.Application.instance
-        self.window = self._app.create_window("Primitive Fitting GUI", 1400, 900)
+        self.window = self._app.create_window("プリミティブフィッティング GUI", 1400, 900)
         self.window.set_on_layout(self._on_layout)
 
         self.scene_widget = gui.SceneWidget()
@@ -534,81 +583,81 @@ class PrimitiveFittingApp:
             self._load_point_cloud(initial_path)
 
     def _build_controls(self, initial_profile: Optional[str]):
-        self.status = gui.Label("Load a point cloud, then Shift+click to pick a seed/ROI.")
+        self.status = gui.Label("点群を読み込み、Shift+クリックでseed/ROIを指定してください。")
         self.panel.add_child(self.status)
 
-        file_group = gui.CollapsableVert("Input", 0, gui.Margins(6, 6, 6, 6))
+        file_group = gui.CollapsableVert("入力", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(file_group)
 
         self.input_path = gui.TextEdit()
-        self.input_path.placeholder_text = "Path to .pcd/.ply"
+        self.input_path.placeholder_text = "PCD/PLY のパス"
         file_group.add_child(self.input_path)
 
         file_buttons = gui.Horiz(4)
-        self.open_button = gui.Button("Open...")
+        self.open_button = gui.Button("開く...")
         self.open_button.set_on_clicked(self._on_open_dialog)
-        self.load_button = gui.Button("Load")
+        self.load_button = gui.Button("読み込み")
         self.load_button.set_on_clicked(self._on_load_clicked)
         file_buttons.add_child(self.open_button)
         file_buttons.add_child(self.load_button)
         file_group.add_child(file_buttons)
 
-        preprocess_group = gui.CollapsableVert("Preprocess", 0, gui.Margins(6, 6, 6, 6))
+        preprocess_group = gui.CollapsableVert("前処理", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(preprocess_group)
 
-        self.preprocess_checkbox = gui.Checkbox("Enable preprocess")
+        self.preprocess_checkbox = gui.Checkbox("前処理を有効化")
         self.preprocess_checkbox.checked = True
         preprocess_group.add_child(self.preprocess_checkbox)
 
         self.voxel_size = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.voxel_size.double_value = 0.02
         voxel_row = gui.Horiz(4)
-        voxel_row.add_child(gui.Label("voxel_size"))
+        voxel_row.add_child(gui.Label("ボクセルサイズ"))
         voxel_row.add_child(self.voxel_size)
         preprocess_group.add_child(voxel_row)
 
-        profile_group = gui.CollapsableVert("Sensor Profile", 0, gui.Margins(6, 6, 6, 6))
+        profile_group = gui.CollapsableVert("センサプロファイル", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(profile_group)
 
         self.profile_combo = gui.Combobox()
-        self.profile_combo.add_item("custom")
+        self.profile_combo.add_item(PROFILE_CUSTOM_LABEL)
         for key in SENSOR_PROFILES:
-            self.profile_combo.add_item(key)
+            self.profile_combo.add_item(_profile_display(key))
         self.profile_combo.set_on_selection_changed(self._on_profile_changed)
         if initial_profile and initial_profile in SENSOR_PROFILES:
-            self.profile_combo.selected_text = initial_profile
+            self.profile_combo.selected_text = _profile_display(initial_profile)
         else:
-            self.profile_combo.selected_text = "custom"
+            self.profile_combo.selected_text = PROFILE_CUSTOM_LABEL
         profile_group.add_child(self.profile_combo)
 
-        mode_group = gui.CollapsableVert("Mode", 0, gui.Margins(6, 6, 6, 6))
+        mode_group = gui.CollapsableVert("モード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(mode_group)
 
         self.mode_combo = gui.Combobox()
-        self.mode_combo.add_item("Plane")
-        self.mode_combo.add_item("Cylinder")
-        self.mode_combo.add_item("Stairs")
-        self.mode_combo.selected_text = "Plane"
+        self.mode_combo.add_item(MODE_PLANE)
+        self.mode_combo.add_item(MODE_CYLINDER)
+        self.mode_combo.add_item(MODE_STAIRS)
+        self.mode_combo.selected_text = MODE_PLANE
         self.mode_combo.set_on_selection_changed(self._on_mode_changed)
         mode_group.add_child(self.mode_combo)
 
-        self.auto_run_checkbox = gui.Checkbox("Auto-run on pick")
+        self.auto_run_checkbox = gui.Checkbox("クリック時に自動実行")
         self.auto_run_checkbox.checked = True
         mode_group.add_child(self.auto_run_checkbox)
 
         run_row = gui.Horiz(4)
-        self.run_button = gui.Button("Run")
+        self.run_button = gui.Button("実行")
         self.run_button.set_on_clicked(self._on_run_clicked)
-        self.clear_button = gui.Button("Clear Results")
+        self.clear_button = gui.Button("結果クリア")
         self.clear_button.set_on_clicked(self._on_clear_clicked)
         run_row.add_child(self.run_button)
         run_row.add_child(self.clear_button)
         mode_group.add_child(run_row)
 
-        roi_group = gui.CollapsableVert("ROI / Seed", 0, gui.Margins(6, 6, 6, 6))
+        roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
 
-        self.adaptive_roi_checkbox = gui.Checkbox("Adaptive ROI")
+        self.adaptive_roi_checkbox = gui.Checkbox("適応ROI")
         self.adaptive_roi_checkbox.checked = True
         roi_group.add_child(self.adaptive_roi_checkbox)
 
@@ -621,12 +670,12 @@ class PrimitiveFittingApp:
         self.roi_min_points = gui.NumberEdit(gui.NumberEdit.INT)
         self.roi_min_points.int_value = 50
 
-        roi_group.add_child(self._labeled_row("r_min", self.roi_r_min))
-        roi_group.add_child(self._labeled_row("r_max", self.roi_r_max))
-        roi_group.add_child(self._labeled_row("r_step", self.roi_r_step))
-        roi_group.add_child(self._labeled_row("min_points", self.roi_min_points))
+        roi_group.add_child(self._labeled_row("r_min (最小半径)", self.roi_r_min))
+        roi_group.add_child(self._labeled_row("r_max (最大半径)", self.roi_r_max))
+        roi_group.add_child(self._labeled_row("r_step (増分)", self.roi_r_step))
+        roi_group.add_child(self._labeled_row("最小点数", self.roi_min_points))
 
-        fit_group = gui.CollapsableVert("Plane/Cylinder Parameters", 0, gui.Margins(6, 6, 6, 6))
+        fit_group = gui.CollapsableVert("平面/円柱パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(fit_group)
 
         self.plane_threshold = gui.NumberEdit(gui.NumberEdit.DOUBLE)
@@ -636,15 +685,15 @@ class PrimitiveFittingApp:
         self.normal_th = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.normal_th.double_value = 30.0
 
-        fit_group.add_child(self._labeled_row("plane_threshold", self.plane_threshold))
-        fit_group.add_child(self._labeled_row("cylinder_threshold", self.cylinder_threshold))
-        fit_group.add_child(self._labeled_row("normal_th (deg)", self.normal_th))
+        fit_group.add_child(self._labeled_row("平面しきい値", self.plane_threshold))
+        fit_group.add_child(self._labeled_row("円柱しきい値", self.cylinder_threshold))
+        fit_group.add_child(self._labeled_row("法線閾値(度)", self.normal_th))
 
         self.expand_method = gui.Combobox()
-        self.expand_method.add_item("component")
-        self.expand_method.add_item("bfs")
-        self.expand_method.selected_text = "component"
-        fit_group.add_child(self._labeled_row("expand_method", self.expand_method))
+        self.expand_method.add_item(EXPAND_METHOD_LABELS["component"])
+        self.expand_method.add_item(EXPAND_METHOD_LABELS["bfs"])
+        self.expand_method.selected_text = EXPAND_METHOD_LABELS["component"]
+        fit_group.add_child(self._labeled_row("拡張方法", self.expand_method))
 
         self.max_expand_radius = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.max_expand_radius.double_value = 5.0
@@ -652,9 +701,9 @@ class PrimitiveFittingApp:
         self.grow_radius.double_value = 0.15
         self.max_refine_iters = gui.NumberEdit(gui.NumberEdit.INT)
         self.max_refine_iters.int_value = 3
-        fit_group.add_child(self._labeled_row("max_expand_radius", self.max_expand_radius))
-        fit_group.add_child(self._labeled_row("grow_radius", self.grow_radius))
-        fit_group.add_child(self._labeled_row("max_refine_iters", self.max_refine_iters))
+        fit_group.add_child(self._labeled_row("最大拡張半径", self.max_expand_radius))
+        fit_group.add_child(self._labeled_row("成長半径", self.grow_radius))
+        fit_group.add_child(self._labeled_row("再フィット回数", self.max_refine_iters))
 
         self.max_expanded_points = gui.NumberEdit(gui.NumberEdit.INT)
         self.max_expanded_points.int_value = 200000
@@ -662,11 +711,11 @@ class PrimitiveFittingApp:
         self.max_frontier.int_value = 200000
         self.max_steps = gui.NumberEdit(gui.NumberEdit.INT)
         self.max_steps.int_value = 1000000
-        fit_group.add_child(self._labeled_row("max_expanded_points", self.max_expanded_points))
-        fit_group.add_child(self._labeled_row("max_frontier", self.max_frontier))
-        fit_group.add_child(self._labeled_row("max_steps", self.max_steps))
+        fit_group.add_child(self._labeled_row("最大点数", self.max_expanded_points))
+        fit_group.add_child(self._labeled_row("フロンティア上限", self.max_frontier))
+        fit_group.add_child(self._labeled_row("最大ステップ", self.max_steps))
 
-        self.adaptive_plane_refine = gui.Checkbox("Adaptive plane threshold")
+        self.adaptive_plane_refine = gui.Checkbox("平面しきい値の自動調整")
         self.adaptive_plane_refine.checked = False
         fit_group.add_child(self.adaptive_plane_refine)
 
@@ -676,17 +725,17 @@ class PrimitiveFittingApp:
         self.adaptive_plane_refine_min_scale.double_value = 0.5
         self.adaptive_plane_refine_max_scale = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.adaptive_plane_refine_max_scale.double_value = 2.0
-        fit_group.add_child(self._labeled_row("adaptive_k", self.adaptive_plane_refine_k))
-        fit_group.add_child(self._labeled_row("adaptive_min_scale", self.adaptive_plane_refine_min_scale))
-        fit_group.add_child(self._labeled_row("adaptive_max_scale", self.adaptive_plane_refine_max_scale))
+        fit_group.add_child(self._labeled_row("適応k", self.adaptive_plane_refine_k))
+        fit_group.add_child(self._labeled_row("最小スケール", self.adaptive_plane_refine_min_scale))
+        fit_group.add_child(self._labeled_row("最大スケール", self.adaptive_plane_refine_max_scale))
 
         self.patch_shape = gui.Combobox()
-        self.patch_shape.add_item("hull")
-        self.patch_shape.add_item("rect")
-        self.patch_shape.selected_text = "hull"
-        fit_group.add_child(self._labeled_row("patch_shape", self.patch_shape))
+        self.patch_shape.add_item(PATCH_SHAPE_LABELS["hull"])
+        self.patch_shape.add_item(PATCH_SHAPE_LABELS["rect"])
+        self.patch_shape.selected_text = PATCH_SHAPE_LABELS["hull"]
+        fit_group.add_child(self._labeled_row("パッチ形状", self.patch_shape))
 
-        stairs_group = gui.CollapsableVert("Stairs Parameters", 0, gui.Margins(6, 6, 6, 6))
+        stairs_group = gui.CollapsableVert("階段パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(stairs_group)
 
         self.max_planes = gui.NumberEdit(gui.NumberEdit.INT)
@@ -701,36 +750,36 @@ class PrimitiveFittingApp:
         self.max_tilt.double_value = 15.0
         self.height_eps = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.height_eps.double_value = 0.03
-        self.no_horizontal_filter = gui.Checkbox("Disable horizontal filter")
+        self.no_horizontal_filter = gui.Checkbox("水平面フィルタ無効")
         self.no_horizontal_filter.checked = False
-        self.no_height_merge = gui.Checkbox("Disable height merge")
+        self.no_height_merge = gui.Checkbox("高さマージ無効")
         self.no_height_merge.checked = False
 
-        stairs_group.add_child(self._labeled_row("max_planes", self.max_planes))
-        stairs_group.add_child(self._labeled_row("min_inliers", self.min_inliers))
-        stairs_group.add_child(self._labeled_row("ransac_n", self.stairs_ransac_n))
-        stairs_group.add_child(self._labeled_row("num_iterations", self.stairs_num_iterations))
-        stairs_group.add_child(self._labeled_row("max_tilt", self.max_tilt))
-        stairs_group.add_child(self._labeled_row("height_eps", self.height_eps))
+        stairs_group.add_child(self._labeled_row("最大平面数", self.max_planes))
+        stairs_group.add_child(self._labeled_row("最小インライヤ数", self.min_inliers))
+        stairs_group.add_child(self._labeled_row("RANSAC n", self.stairs_ransac_n))
+        stairs_group.add_child(self._labeled_row("反復回数", self.stairs_num_iterations))
+        stairs_group.add_child(self._labeled_row("最大傾斜角", self.max_tilt))
+        stairs_group.add_child(self._labeled_row("高さ許容", self.height_eps))
         stairs_group.add_child(self.no_horizontal_filter)
         stairs_group.add_child(self.no_height_merge)
 
-        output_group = gui.CollapsableVert("Output", 0, gui.Margins(6, 6, 6, 6))
+        output_group = gui.CollapsableVert("出力", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(output_group)
 
         self.output_path_edit = gui.TextEdit()
         self.output_path_edit.text_value = self.output_path
-        output_group.add_child(self._labeled_row("output.json", self.output_path_edit))
+        output_group.add_child(self._labeled_row("出力JSON", self.output_path_edit))
 
         self.stairs_output_edit = gui.TextEdit()
         self.stairs_output_edit.text_value = self.stairs_output_path
-        output_group.add_child(self._labeled_row("stairs.json", self.stairs_output_edit))
+        output_group.add_child(self._labeled_row("階段JSON", self.stairs_output_edit))
 
         self.export_mesh_edit = gui.TextEdit()
-        self.export_mesh_edit.placeholder_text = "export mesh (PLY/OBJ)"
-        output_group.add_child(self._labeled_row("export_mesh", self.export_mesh_edit))
+        self.export_mesh_edit.placeholder_text = "メッシュ出力 (PLY/OBJ)"
+        output_group.add_child(self._labeled_row("メッシュ出力", self.export_mesh_edit))
 
-        self.auto_save_checkbox = gui.Checkbox("Auto-save results")
+        self.auto_save_checkbox = gui.Checkbox("結果を自動保存")
         self.auto_save_checkbox.checked = True
         output_group.add_child(self.auto_save_checkbox)
 
@@ -738,8 +787,10 @@ class PrimitiveFittingApp:
         self._stairs_group = stairs_group
         self._update_mode_visibility()
 
-        if self.profile_combo.selected_text != "custom":
-            self._apply_profile(self.profile_combo.selected_text)
+        if self.profile_combo.selected_text != PROFILE_CUSTOM_LABEL:
+            key = _profile_key_from_display(self.profile_combo.selected_text)
+            if key is not None:
+                self._apply_profile(key)
 
     def _labeled_row(self, label: str, widget: gui.Widget) -> gui.Widget:
         row = gui.Horiz(4)
@@ -754,9 +805,9 @@ class PrimitiveFittingApp:
         self.panel.frame = gui.Rect(r.get_right() - panel_width, r.y, panel_width, r.height)
 
     def _on_open_dialog(self):
-        dlg = gui.FileDialog(gui.FileDialog.OPEN, "Choose point cloud", self.window.theme)
-        dlg.add_filter(".pcd .ply", "Point cloud files (.pcd, .ply)")
-        dlg.add_filter("", "All files")
+        dlg = gui.FileDialog(gui.FileDialog.OPEN, "点群ファイルを選択", self.window.theme)
+        dlg.add_filter(".pcd .ply", "点群ファイル (.pcd, .ply)")
+        dlg.add_filter("", "すべてのファイル")
         dlg.set_on_cancel(self._on_dialog_cancel)
         dlg.set_on_done(self._on_open_done)
         self.window.show_dialog(dlg)
@@ -773,15 +824,16 @@ class PrimitiveFittingApp:
     def _on_load_clicked(self):
         path = self.input_path.text_value.strip()
         if not path:
-            self._set_status("Input path is empty.")
+            self._set_status("入力パスが空です。")
             return
         self._load_point_cloud(path)
 
     def _on_profile_changed(self, text: str, index: int):
         _ = index
-        if text == "custom":
+        key = _profile_key_from_display(text)
+        if key is None:
             return
-        self._apply_profile(text)
+        self._apply_profile(key)
 
     def _apply_profile(self, key: str):
         profile = SENSOR_PROFILES.get(key)
@@ -802,8 +854,8 @@ class PrimitiveFittingApp:
 
     def _update_mode_visibility(self):
         mode = self.mode_combo.selected_text
-        self._fit_group.visible = mode in ("Plane", "Cylinder")
-        self._stairs_group.visible = mode == "Stairs"
+        self._fit_group.visible = mode in (MODE_PLANE, MODE_CYLINDER)
+        self._stairs_group.visible = mode == MODE_STAIRS
 
     def _on_run_clicked(self):
         self._run_fit()
@@ -811,7 +863,7 @@ class PrimitiveFittingApp:
     def _on_clear_clicked(self):
         self._clear_results()
         self.results = {"planes": [], "cylinders": []}
-        self._set_status("Cleared results.")
+        self._set_status("結果をクリアしました。")
 
     def _on_mouse(self, event):
         if event.type == gui.MouseEvent.Type.BUTTON_DOWN and event.is_modifier_down(
@@ -851,14 +903,14 @@ class PrimitiveFittingApp:
         try:
             self.pcd_raw = load_point_cloud(path)
         except Exception as exc:
-            self._set_status(f"Failed to load: {exc}")
+            self._set_status(f"読み込み失敗: {exc}")
             return
 
         if self.preprocess_checkbox.checked:
             try:
                 self.pcd = preprocess_point_cloud(self.pcd_raw, self.voxel_size.double_value)
             except Exception as exc:
-                self._set_status(f"Preprocess failed: {exc}")
+                self._set_status(f"前処理失敗: {exc}")
                 return
         else:
             self.pcd = o3d.geometry.PointCloud(self.pcd_raw)
@@ -880,7 +932,7 @@ class PrimitiveFittingApp:
         self.scene_widget.look_at(center, center - [0, 0, 3], [0, -1, 0])
 
         self._clear_results()
-        self._set_status(f"Loaded {len(self.all_points)} points. Shift+click to pick.")
+        self._set_status(f"{len(self.all_points)}点を読み込みました。Shift+クリックで指定してください。")
 
     def _set_seed(self, center: np.ndarray):
         self.last_pick = np.asarray(center, dtype=float)
@@ -892,7 +944,7 @@ class PrimitiveFittingApp:
         seed.compute_vertex_normals()
         self._seed_name = "seed_marker"
         self.scene_widget.scene.add_geometry(self._seed_name, seed, self._mesh_material)
-        self._set_status(f"Picked seed: {np.round(self.last_pick, 4).tolist()}")
+        self._set_status(f"シード選択: {np.round(self.last_pick, 4).tolist()}")
 
     def _clear_results(self):
         for name in self._result_names:
@@ -902,27 +954,27 @@ class PrimitiveFittingApp:
 
     def _run_fit(self):
         if self.pcd is None or self.all_points is None:
-            self._set_status("No point cloud loaded.")
+            self._set_status("点群が読み込まれていません。")
             return
         if self.last_pick is None:
-            self._set_status("Pick a seed/ROI point first (Shift+click).")
+            self._set_status("先にShift+クリックでseed/ROIを指定してください。")
             return
 
         seed_center = self.last_pick
         seed_indices, seed_radius = self._compute_seed_indices(seed_center)
         if len(seed_indices) == 0:
-            self._set_status("ROI is empty; adjust r_min/r_max or pick again.")
+            self._set_status("ROIが空です。r_min/r_maxを調整するか再クリックしてください。")
             return
 
         mode = self.mode_combo.selected_text
-        if mode == "Plane":
+        if mode == MODE_PLANE:
             self._run_plane(seed_center, seed_radius)
-        elif mode == "Cylinder":
+        elif mode == MODE_CYLINDER:
             self._run_cylinder(seed_center, seed_radius)
-        elif mode == "Stairs":
+        elif mode == MODE_STAIRS:
             self._run_stairs(seed_center, seed_indices)
         else:
-            self._set_status(f"Unknown mode: {mode}")
+            self._set_status(f"未対応のモード: {mode}")
 
     def _compute_seed_indices(self, seed_center: np.ndarray) -> Tuple[np.ndarray, float]:
         if not self.adaptive_roi_checkbox.checked:
@@ -953,7 +1005,7 @@ class PrimitiveFittingApp:
             grow_radius=float(self.grow_radius.double_value),
             distance_threshold=float(self.plane_threshold.double_value),
             normal_threshold_deg=float(self.normal_th.double_value),
-            expand_method=self.expand_method.selected_text,
+            expand_method=_expand_method_value(self.expand_method.selected_text),
             max_refine_iters=int(self.max_refine_iters.int_value),
             adaptive_refine_threshold=bool(self.adaptive_plane_refine.checked),
             adaptive_refine_k=float(self.adaptive_plane_refine_k.double_value),
@@ -965,7 +1017,7 @@ class PrimitiveFittingApp:
             verbose=False,
         )
         if not result.success or result.plane is None:
-            self._set_status(f"Plane failed: {result.message}")
+            self._set_status(f"平面抽出失敗: {result.message}")
             return
 
         try:
@@ -974,10 +1026,10 @@ class PrimitiveFittingApp:
                 self.all_points,
                 np.array([0.2, 0.8, 0.2]),
                 padding=0.02,
-                patch_shape=self.patch_shape.selected_text,
+                patch_shape=_patch_shape_value(self.patch_shape.selected_text),
             )
         except Exception as exc:
-            self._set_status(f"Plane patch failed: {exc}")
+            self._set_status(f"平面パッチ生成失敗: {exc}")
             return
 
         name = "plane_result"
@@ -989,7 +1041,7 @@ class PrimitiveFittingApp:
         if self.auto_save_checkbox.checked:
             save_results(self.results, self.output_path_edit.text_value)
         self._set_status(
-            f"Plane OK: inliers={result.plane.inlier_count}, area={result.area:.3f} m^2"
+            f"平面OK: インライヤ={result.plane.inlier_count}, 面積={result.area:.3f} m^2"
         )
 
     def _run_cylinder(self, seed_center: np.ndarray, seed_radius: float):
@@ -1003,7 +1055,7 @@ class PrimitiveFittingApp:
             grow_radius=float(self.grow_radius.double_value),
             distance_threshold=float(self.cylinder_threshold.double_value),
             normal_threshold_deg=float(self.normal_th.double_value),
-            expand_method=self.expand_method.selected_text,
+            expand_method=_expand_method_value(self.expand_method.selected_text),
             max_refine_iters=int(self.max_refine_iters.int_value),
             max_expanded_points=int(self.max_expanded_points.int_value),
             max_frontier=int(self.max_frontier.int_value),
@@ -1011,7 +1063,7 @@ class PrimitiveFittingApp:
             verbose=False,
         )
         if not result.success or result.cylinder is None:
-            self._set_status(f"Cylinder failed: {result.message}")
+            self._set_status(f"円柱抽出失敗: {result.message}")
             return
 
         cyl_mesh = create_cylinder_mesh(
@@ -1021,7 +1073,7 @@ class PrimitiveFittingApp:
             result.cylinder.length,
         )
         if cyl_mesh is None:
-            self._set_status("Cylinder mesh failed")
+            self._set_status("円柱メッシュ生成失敗")
             return
 
         name = "cylinder_result"
@@ -1033,14 +1085,14 @@ class PrimitiveFittingApp:
         if self.auto_save_checkbox.checked:
             save_results(self.results, self.output_path_edit.text_value)
         self._set_status(
-            f"Cylinder OK: radius={result.cylinder.radius:.4f} m, length={result.cylinder.length:.3f} m"
+            f"円柱OK: 半径={result.cylinder.radius:.4f} m, 長さ={result.cylinder.length:.3f} m"
         )
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
         self._clear_results()
         roi_points = self.all_points[seed_indices]
         if len(roi_points) == 0:
-            self._set_status("ROI has no points")
+            self._set_status("ROIに点がありません。")
             return
 
         planes = extract_stair_planes(
@@ -1057,7 +1109,7 @@ class PrimitiveFittingApp:
             verbose=False,
         )
         if len(planes) == 0:
-            self._set_status("No stair planes detected")
+            self._set_status("階段平面が検出できませんでした。")
             return
 
         colors = generate_plane_colors(len(planes))
@@ -1068,7 +1120,7 @@ class PrimitiveFittingApp:
                     roi_points,
                     color,
                     padding=0.02,
-                    patch_shape=self.patch_shape.selected_text,
+                    patch_shape=_patch_shape_value(self.patch_shape.selected_text),
                 )
             except Exception:
                 continue
@@ -1082,7 +1134,7 @@ class PrimitiveFittingApp:
                 planes,
                 roi_points,
                 self.stairs_output_edit.text_value,
-                patch_shape=self.patch_shape.selected_text,
+                patch_shape=_patch_shape_value(self.patch_shape.selected_text),
             )
 
         export_path = self.export_mesh_edit.text_value.strip()
@@ -1090,7 +1142,7 @@ class PrimitiveFittingApp:
             combined = _combine_meshes(self._result_meshes)
             o3d.io.write_triangle_mesh(export_path, combined)
 
-        self._set_status(f"Stairs OK: {len(planes)} planes")
+        self._set_status(f"階段OK: {len(planes)}平面")
 
 
 def _combine_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> o3d.geometry.TriangleMesh:
