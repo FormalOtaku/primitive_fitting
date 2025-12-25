@@ -680,6 +680,10 @@ class PrimitiveFittingApp:
         self.auto_run_checkbox.checked = True
         mode_group.add_child(self.auto_run_checkbox)
 
+        self.keep_results_checkbox = gui.Checkbox("結果を保持")
+        self.keep_results_checkbox.checked = True
+        mode_group.add_child(self.keep_results_checkbox)
+
         run_row = gui.Horiz(4)
         self.run_button = gui.Button("実行")
         self.run_button.set_on_clicked(self._on_run_clicked)
@@ -1057,7 +1061,8 @@ class PrimitiveFittingApp:
         return indices, radius
 
     def _run_plane(self, seed_center: np.ndarray, seed_radius: float):
-        self._clear_results()
+        if not self.keep_results_checkbox.checked:
+            self._clear_results()
         result = expand_plane_from_seed(
             self.all_points,
             seed_center,
@@ -1107,7 +1112,8 @@ class PrimitiveFittingApp:
         )
 
     def _run_cylinder(self, seed_center: np.ndarray, seed_radius: float):
-        self._clear_results()
+        if not self.keep_results_checkbox.checked:
+            self._clear_results()
         result = probe_cylinder_from_seed(
             self.all_points,
             seed_center,
@@ -1155,7 +1161,8 @@ class PrimitiveFittingApp:
         )
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
-        self._clear_results()
+        if not self.keep_results_checkbox.checked:
+            self._clear_results()
         roi_points = self.all_points[seed_indices]
         if len(roi_points) == 0:
             self._set_status("ROIに点がありません。")
