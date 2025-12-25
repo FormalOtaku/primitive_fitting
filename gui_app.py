@@ -586,7 +586,7 @@ class PrimitiveFittingApp:
         self.scene_widget.set_on_mouse(self._on_mouse)
         self.window.add_child(self.scene_widget)
 
-        self.panel = gui.Vert(0, gui.Margins(8, 8, 8, 8))
+        self.panel = gui.ScrollableVert(0, gui.Margins(8, 8, 8, 8))
         self.window.add_child(self.panel)
 
         self._pcd_material = rendering.MaterialRecord()
