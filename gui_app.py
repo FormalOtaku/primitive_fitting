@@ -599,9 +599,12 @@ class PrimitiveFittingApp:
         self._line_material.shader = "unlitLine"
         self._line_material.line_width = 1.0 * self.window.scaling
 
+        self._rng = np.random.default_rng(1234)
+
         self._result_names: List[str] = []
         self._result_meshes: List[o3d.geometry.TriangleMesh] = []
         self._seed_name: Optional[str] = None
+        self._pointcloud_name: Optional[str] = None
 
         self._objects: Dict[str, Dict[str, object]] = {}
         self._outliner_names: List[str] = []
@@ -617,6 +620,10 @@ class PrimitiveFittingApp:
         self._ground_name: Optional[str] = None
         self.ceiling_plane: Optional[PlaneParam] = None
         self._ceiling_name: Optional[str] = None
+        self._all_points_original: Optional[np.ndarray] = None
+        self._all_normals_original: Optional[np.ndarray] = None
+        self._edit_mask: Optional[np.ndarray] = None
+        self._edit_history: List[np.ndarray] = []
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -729,6 +736,13 @@ class PrimitiveFittingApp:
         outliner_row.add_child(self.outliner_solid_button)
         outliner_row.add_child(self.outliner_wire_button)
         outliner_group.add_child(outliner_row)
+
+        self.outliner_color = gui.ColorEdit()
+        self.outliner_color.color_value = gui.Color(0.8, 0.2, 0.2, 1.0)
+        outliner_group.add_child(self._labeled_row("色", self.outliner_color))
+        self.outliner_apply_color = gui.Button("色を適用")
+        self.outliner_apply_color.set_on_clicked(self._on_apply_color)
+        outliner_group.add_child(self.outliner_apply_color)
 
         roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
@@ -956,6 +970,27 @@ class PrimitiveFittingApp:
         self.save_profile_button.set_on_clicked(self._on_save_profile)
         profile_group.add_child(self.save_profile_button)
 
+        edit_group = gui.CollapsableVert("編集", 0, gui.Margins(6, 6, 6, 6))
+        self.panel.add_child(edit_group)
+        edit_group.set_is_open(False)
+
+        self.edit_mode = gui.Checkbox("編集モード（Shift+クリックで削除）")
+        self.edit_mode.checked = False
+        edit_group.add_child(self.edit_mode)
+
+        self.edit_radius = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.edit_radius.double_value = 0.10
+        edit_group.add_child(self._labeled_row("削除半径(m)", self.edit_radius))
+
+        edit_row = gui.Horiz(4)
+        self.edit_undo_button = gui.Button("削除を戻す")
+        self.edit_undo_button.set_on_clicked(self._on_edit_undo)
+        self.edit_reset_button = gui.Button("編集リセット")
+        self.edit_reset_button.set_on_clicked(self._on_edit_reset)
+        edit_row.add_child(self.edit_undo_button)
+        edit_row.add_child(self.edit_reset_button)
+        edit_group.add_child(edit_row)
+
         self._fit_group = fit_group
         self._stairs_group = stairs_group
         self._update_mode_visibility()
@@ -1064,9 +1099,12 @@ class PrimitiveFittingApp:
                     if snapped is None:
                         self._set_status("クリック位置の近くに点がありません。ズームして再クリックしてください。")
                         return
-                    self._set_seed(snapped)
-                    if self.auto_run_checkbox.checked:
-                        self._run_fit()
+                    if self.edit_mode.checked:
+                        self._erase_points_at(snapped)
+                    else:
+                        self._set_seed(snapped)
+                        if self.auto_run_checkbox.checked:
+                            self._run_fit()
 
                 gui.Application.instance.post_to_main_thread(self.window, update)
 
@@ -1100,18 +1138,15 @@ class PrimitiveFittingApp:
 
         self.all_points = np.asarray(self.pcd.points)
         self.all_normals = np.asarray(self.pcd.normals) if self.pcd.has_normals() else None
-        try:
-            self._kdtree = o3d.geometry.KDTreeFlann(self.pcd)
-        except Exception:
-            self._kdtree = None
+        self._all_points_original = np.asarray(self.all_points, dtype=float)
+        self._all_normals_original = (
+            np.asarray(self.all_normals, dtype=float) if self.all_normals is not None else None
+        )
+        self._edit_mask = np.ones(len(self._all_points_original), dtype=bool)
+        self._edit_history = []
 
         self._reset_scene_objects()
-        self._register_object(
-            label="点群",
-            geometry=self.pcd,
-            kind="pcd",
-            category="base",
-        )
+        self._update_point_cloud_view(reset_camera=True)
 
         bounds = self.scene_widget.scene.bounding_box
         center = bounds.get_center()
@@ -1136,6 +1171,73 @@ class PrimitiveFittingApp:
         self._seed_name = "seed_marker"
         self.scene_widget.scene.add_geometry(self._seed_name, seed, self._mesh_material)
         self._set_status(f"シード選択: {np.round(self.last_pick, 4).tolist()}")
+
+    def _update_point_cloud_view(self, *, reset_camera: bool = False):
+        if self._all_points_original is None:
+            return
+        mask = self._edit_mask if self._edit_mask is not None else np.ones(len(self._all_points_original), dtype=bool)
+        pts = self._all_points_original[mask]
+        self.pcd = o3d.geometry.PointCloud()
+        self.pcd.points = o3d.utility.Vector3dVector(pts)
+        if self._all_normals_original is not None and len(self._all_normals_original) == len(self._all_points_original):
+            norms = self._all_normals_original[mask]
+            self.pcd.normals = o3d.utility.Vector3dVector(norms)
+        self.all_points = np.asarray(self.pcd.points)
+        self.all_normals = np.asarray(self.pcd.normals) if self.pcd.has_normals() else None
+
+        try:
+            self._kdtree = o3d.geometry.KDTreeFlann(self.pcd)
+        except Exception:
+            self._kdtree = None
+
+        if self._pointcloud_name is not None:
+            self._remove_object(self._pointcloud_name)
+        self._pointcloud_name = self._register_object(
+            label="点群",
+            geometry=self.pcd,
+            kind="pcd",
+            category="base",
+        )
+
+        if reset_camera:
+            bounds = self.scene_widget.scene.bounding_box
+            center = bounds.get_center()
+            self.scene_widget.setup_camera(60, bounds, center)
+            self.scene_widget.look_at(center, center - [0, 0, 3], [0, -1, 0])
+
+    def _erase_points_at(self, center: np.ndarray):
+        if self._all_points_original is None or self._edit_mask is None:
+            return
+        radius = float(self.edit_radius.double_value)
+        if radius <= 0:
+            return
+        diff = self._all_points_original - center
+        dist2 = np.einsum("ij,ij->i", diff, diff)
+        to_remove = np.where(self._edit_mask & (dist2 <= radius * radius))[0]
+        if len(to_remove) == 0:
+            self._set_status("削除対象が見つかりませんでした。")
+            return
+        self._edit_mask[to_remove] = False
+        self._edit_history.append(to_remove)
+        self._update_point_cloud_view()
+        self._set_status(f"{len(to_remove)}点を削除しました（元データは保持）")
+
+    def _on_edit_undo(self):
+        if not self._edit_history or self._edit_mask is None:
+            self._set_status("戻す操作がありません。")
+            return
+        last = self._edit_history.pop()
+        self._edit_mask[last] = True
+        self._update_point_cloud_view()
+        self._set_status("削除を戻しました。")
+
+    def _on_edit_reset(self):
+        if self._all_points_original is None:
+            return
+        self._edit_mask = np.ones(len(self._all_points_original), dtype=bool)
+        self._edit_history = []
+        self._update_point_cloud_view()
+        self._set_status("編集をリセットしました。")
 
     def _snap_to_point(self, world: np.ndarray) -> Optional[np.ndarray]:
         if self._kdtree is None or self.all_points is None:
@@ -1168,6 +1270,7 @@ class PrimitiveFittingApp:
         self._selected_outliner_index = -1
         self._objects = {}
         self._object_counter = 0
+        self._pointcloud_name = None
 
     def _outliner_label(self, name: str) -> str:
         obj = self._objects.get(name, {})
@@ -1192,6 +1295,7 @@ class PrimitiveFittingApp:
         geometry: o3d.geometry.Geometry,
         kind: str,
         category: str,
+        color: Optional[np.ndarray] = None,
     ) -> str:
         self._object_counter += 1
         base_name = f"{category}_{self._object_counter}"
@@ -1213,10 +1317,18 @@ class PrimitiveFittingApp:
         if kind == "pcd":
             self.scene_widget.scene.add_geometry(solid_name, geometry, self._pcd_material)
         else:
+            if color is not None:
+                try:
+                    geometry.paint_uniform_color(color)
+                except Exception:
+                    pass
             self.scene_widget.scene.add_geometry(solid_name, geometry, self._mesh_material)
             try:
                 line = o3d.geometry.LineSet.create_from_triangle_mesh(geometry)
-                line.paint_uniform_color((0.9, 0.9, 0.9))
+                if color is not None:
+                    line.paint_uniform_color(color)
+                else:
+                    line.paint_uniform_color((0.9, 0.9, 0.9))
                 obj["wire"] = line
             except Exception:
                 obj["wire"] = None
@@ -1289,6 +1401,33 @@ class PrimitiveFittingApp:
         obj["visible"] = True if mode != "hidden" else False
         self._sync_object_visibility(name)
         self._refresh_outliner()
+
+    def _on_apply_color(self):
+        idx = int(self.outliner.selected_index)
+        if idx < 0 or idx >= len(self._outliner_names):
+            return
+        name = self._outliner_names[idx]
+        obj = self._objects.get(name)
+        if obj is None or obj.get("kind") != "mesh":
+            return
+        color = self.outliner_color.color_value
+        rgb = np.array([color.red, color.green, color.blue], dtype=float)
+        mesh = obj.get("solid")
+        if mesh is not None:
+            try:
+                mesh.paint_uniform_color(rgb)
+            except Exception:
+                pass
+        wire = obj.get("wire")
+        if wire is not None:
+            try:
+                wire.colors = o3d.utility.Vector3dVector(
+                    np.tile(rgb, (len(wire.lines), 1))
+                )
+            except Exception:
+                pass
+        obj["color"] = rgb
+        self._sync_object_visibility(name)
 
     def _on_outliner_select(self, _value, _is_dbl_click=False):
         try:
@@ -1426,12 +1565,14 @@ class PrimitiveFittingApp:
             self._set_status(f"平面パッチ生成失敗: {exc}")
             return
 
+        color = self._rng.uniform(0.2, 0.9, size=3)
         label = f"平面 {len(self._result_names) + 1}"
         name = self._register_object(
             label=label,
             geometry=mesh,
             kind="mesh",
             category="result",
+            color=color,
         )
         self._result_names.append(name)
         self._result_meshes.append(mesh)
@@ -1518,12 +1659,14 @@ class PrimitiveFittingApp:
             self._set_status("円柱メッシュ生成失敗")
             return
 
+        color = self._rng.uniform(0.2, 0.9, size=3)
         label = f"円柱 {len(self._result_names) + 1}"
         name = self._register_object(
             label=label,
             geometry=cyl_mesh,
             kind="mesh",
             category="result",
+            color=color,
         )
         self._result_names.append(name)
         self._result_meshes.append(cyl_mesh)
@@ -1644,6 +1787,7 @@ class PrimitiveFittingApp:
                 geometry=mesh,
                 kind="mesh",
                 category="ground",
+                color=np.array([0.7, 0.2, 0.7]),
             )
         except Exception:
             self._ground_name = None
@@ -1727,6 +1871,7 @@ class PrimitiveFittingApp:
                 geometry=mesh,
                 kind="mesh",
                 category="ceiling",
+                color=np.array([0.2, 0.4, 0.9]),
             )
         except Exception:
             self._ceiling_name = None
@@ -1770,12 +1915,14 @@ class PrimitiveFittingApp:
                 )
             except Exception:
                 continue
+            color = self._rng.uniform(0.2, 0.9, size=3)
             label = f"階段平面 {len(self._result_names) + 1}"
             name = self._register_object(
                 label=label,
                 geometry=mesh,
                 kind="mesh",
                 category="result",
+                color=color,
             )
             self._result_names.append(name)
             self._result_meshes.append(mesh)
