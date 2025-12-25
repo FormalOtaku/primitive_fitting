@@ -17,7 +17,7 @@ from primitives import (
     CylinderParam,
     adaptive_seed_indices,
     expand_plane_from_seed,
-    expand_cylinder_from_seed,
+    probe_cylinder_from_seed,
     extract_stair_planes,
     create_cylinder_mesh,
 )
@@ -1108,31 +1108,35 @@ class PrimitiveFittingApp:
 
     def _run_cylinder(self, seed_center: np.ndarray, seed_radius: float):
         self._clear_results()
-        result = expand_cylinder_from_seed(
+        result = probe_cylinder_from_seed(
             self.all_points,
             seed_center,
             normals=self.all_normals,
-            seed_radius=seed_radius,
-            max_expand_radius=float(self.max_expand_radius.double_value),
+            seed_radius_start=float(self.roi_r_min.double_value),
+            seed_radius_max=float(self.roi_r_max.double_value),
+            seed_radius_step=float(self.roi_r_step.double_value),
+            min_seed_points=int(self.roi_min_points.int_value),
+            circle_ransac_iters=200,
+            circle_inlier_threshold=float(self.cylinder_threshold.double_value),
+            length_margin=0.05,
+            surface_threshold=float(self.cylinder_threshold.double_value),
+            cap_margin=0.05,
             grow_radius=float(self.grow_radius.double_value),
-            distance_threshold=float(self.cylinder_threshold.double_value),
-            normal_threshold_deg=float(self.normal_th.double_value),
-            expand_method=_expand_method_value(self.expand_method.selected_text),
-            max_refine_iters=int(self.max_refine_iters.int_value),
+            max_expand_radius=float(self.max_expand_radius.double_value),
             max_expanded_points=int(self.max_expanded_points.int_value),
             max_frontier=int(self.max_frontier.int_value),
             max_steps=int(self.max_steps.int_value),
-            verbose=False,
+            refine_iters=int(self.max_refine_iters.int_value),
         )
-        if not result.success or result.cylinder is None:
+        if not result.success or result.final is None:
             self._set_status(f"円柱抽出失敗: {result.message}")
             return
 
         cyl_mesh = create_cylinder_mesh(
-            result.cylinder.axis_point,
-            result.cylinder.axis_direction,
-            result.cylinder.radius,
-            result.cylinder.length,
+            result.final.axis_point,
+            result.final.axis_direction,
+            result.final.radius,
+            result.final.length,
         )
         if cyl_mesh is None:
             self._set_status("円柱メッシュ生成失敗")
@@ -1143,11 +1147,11 @@ class PrimitiveFittingApp:
         self._result_names.append(name)
         self._result_meshes.append(cyl_mesh)
 
-        self.results = append_cylinder_result(self.results, result.cylinder)
+        self.results = append_cylinder_result(self.results, result.final)
         if self.auto_save_checkbox.checked:
             save_results(self.results, self.output_path_edit.text_value)
         self._set_status(
-            f"円柱OK: 半径={result.cylinder.radius:.4f} m, 長さ={result.cylinder.length:.3f} m"
+            f"円柱OK: 半径={result.final.radius:.4f} m, 長さ={result.final.length:.3f} m"
         )
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
