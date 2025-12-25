@@ -580,6 +580,16 @@ class PrimitiveFittingApp:
         self.window = self._app.create_window("Primitive Fitting GUI", 1400, 900)
         self.window.set_on_layout(self._on_layout)
 
+        self._pcd_material = rendering.MaterialRecord()
+        self._pcd_material.shader = "defaultUnlit"
+        self._pcd_material.point_size = 3 * self.window.scaling
+
+        self._mesh_material = rendering.MaterialRecord()
+        self._mesh_material.shader = "defaultLit"
+        self._line_material = rendering.MaterialRecord()
+        self._line_material.shader = "unlitLine"
+        self._line_material.line_width = 1.0 * self.window.scaling
+
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
         self.scene_widget.scene.set_background([0.02, 0.02, 0.02, 1.0])
@@ -595,16 +605,6 @@ class PrimitiveFittingApp:
 
         self.panel = gui.ScrollableVert(0, gui.Margins(8, 8, 8, 8))
         self.window.add_child(self.panel)
-
-        self._pcd_material = rendering.MaterialRecord()
-        self._pcd_material.shader = "defaultUnlit"
-        self._pcd_material.point_size = 3 * self.window.scaling
-
-        self._mesh_material = rendering.MaterialRecord()
-        self._mesh_material.shader = "defaultLit"
-        self._line_material = rendering.MaterialRecord()
-        self._line_material.shader = "unlitLine"
-        self._line_material.line_width = 1.0 * self.window.scaling
 
         self._rng = np.random.default_rng(1234)
 
