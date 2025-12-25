@@ -1280,6 +1280,12 @@ def parse_args():
         help="Launch Open3D GUI app with side panel controls"
     )
     parser.add_argument(
+        "--gui-font",
+        type=str,
+        default=None,
+        help="Font family name or font file path for GUI (e.g., NotoSansCJK or /path/to/font.ttc)"
+    )
+    parser.add_argument(
         "--output", "-o",
         type=str,
         default="fit_results.json",
