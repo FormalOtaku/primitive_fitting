@@ -18,6 +18,7 @@ from primitives import (
     adaptive_seed_indices,
     expand_plane_from_seed,
     probe_cylinder_from_seed,
+    extract_multi_planes,
     extract_stair_planes,
     create_cylinder_mesh,
 )
@@ -730,6 +731,27 @@ class PrimitiveFittingApp:
         outliner_row.add_child(self.outliner_wire_button)
         outliner_group.add_child(outliner_row)
 
+        auto_group = gui.CollapsableVert("自動抽出", 0, gui.Margins(6, 6, 6, 6))
+        self.panel.add_child(auto_group)
+        auto_group.set_is_open(False)
+
+        self.auto_plane_button = gui.Button("全域平面抽出")
+        self.auto_plane_button.set_on_clicked(self._on_auto_plane_extract)
+        auto_group.add_child(self.auto_plane_button)
+
+        self.auto_plane_max = gui.NumberEdit(gui.NumberEdit.INT)
+        self.auto_plane_max.int_value = 10
+        self.auto_plane_min_inliers = gui.NumberEdit(gui.NumberEdit.INT)
+        self.auto_plane_min_inliers.int_value = 150
+        self.auto_plane_ransac_n = gui.NumberEdit(gui.NumberEdit.INT)
+        self.auto_plane_ransac_n.int_value = 3
+        self.auto_plane_iters = gui.NumberEdit(gui.NumberEdit.INT)
+        self.auto_plane_iters.int_value = 1000
+        auto_group.add_child(self._labeled_row("最大平面数", self.auto_plane_max))
+        auto_group.add_child(self._labeled_row("最小インライヤ数", self.auto_plane_min_inliers))
+        auto_group.add_child(self._labeled_row("RANSAC n", self.auto_plane_ransac_n))
+        auto_group.add_child(self._labeled_row("反復回数", self.auto_plane_iters))
+
         roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
         roi_group.set_is_open(False)
@@ -1277,6 +1299,54 @@ class PrimitiveFittingApp:
             self._selected_outliner_index = int(self.outliner.selected_index)
         except Exception:
             self._selected_outliner_index = -1
+
+    def _on_auto_plane_extract(self):
+        if self.pcd is None or self.all_points is None:
+            self._set_status("点群が読み込まれていません。")
+            return
+        if not self.keep_results_checkbox.checked:
+            self._clear_results()
+
+        result = extract_multi_planes(
+            self.all_points,
+            distance_threshold=float(self.plane_threshold.double_value),
+            ransac_n=int(self.auto_plane_ransac_n.int_value),
+            num_iterations=int(self.auto_plane_iters.int_value),
+            min_inliers=int(self.auto_plane_min_inliers.int_value),
+            max_planes=int(self.auto_plane_max.int_value),
+            verbose=False,
+        )
+        planes = result.planes
+        if len(planes) == 0:
+            self._set_status("自動平面抽出: 平面が見つかりませんでした。")
+            return
+
+        colors = generate_plane_colors(len(planes))
+        for i, (plane, color) in enumerate(zip(planes, colors), start=1):
+            try:
+                mesh, _ = create_plane_patch_mesh(
+                    plane,
+                    self.all_points,
+                    color,
+                    padding=0.02,
+                    patch_shape=_patch_shape_value(self.patch_shape.selected_text),
+                )
+            except Exception:
+                continue
+            label = f"自動平面 {i:02d}"
+            name = self._register_object(
+                label=label,
+                geometry=mesh,
+                kind="mesh",
+                category="result",
+            )
+            self._result_names.append(name)
+            self._result_meshes.append(mesh)
+            self.results = append_plane_result(self.results, plane)
+
+        if self.auto_save_checkbox.checked:
+            save_results(self.results, self.output_path_edit.text_value)
+        self._set_status(f"自動平面抽出: {len(planes)}枚")
 
     def _on_save_profile(self):
         path = self.cylinder_profile_path.text_value.strip()
