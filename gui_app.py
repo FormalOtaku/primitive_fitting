@@ -604,8 +604,8 @@ class PrimitiveFittingApp:
         self._seed_name: Optional[str] = None
 
         self._objects: Dict[str, Dict[str, object]] = {}
-        self._outliner_items: Dict[int, str] = {}
-        self._outliner_root: Optional[int] = None
+        self._outliner_names: List[str] = []
+        self._selected_outliner_index: int = -1
         self._object_counter = 0
 
         self.pcd_raw: Optional[o3d.geometry.PointCloud] = None
@@ -635,6 +635,7 @@ class PrimitiveFittingApp:
 
         file_group = gui.CollapsableVert("入力", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(file_group)
+        file_group.set_is_open(False)
 
         self.input_path = gui.TextEdit()
         self.input_path.placeholder_text = "PCD/PLY のパス"
@@ -651,6 +652,7 @@ class PrimitiveFittingApp:
 
         preprocess_group = gui.CollapsableVert("前処理", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(preprocess_group)
+        preprocess_group.set_is_open(False)
 
         self.preprocess_checkbox = gui.Checkbox("前処理を有効化")
         self.preprocess_checkbox.checked = True
@@ -665,6 +667,7 @@ class PrimitiveFittingApp:
 
         profile_group = gui.CollapsableVert("センサプロファイル", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(profile_group)
+        profile_group.set_is_open(False)
 
         self.profile_combo = gui.Combobox()
         self.profile_combo.add_item(PROFILE_CUSTOM_LABEL)
@@ -679,6 +682,7 @@ class PrimitiveFittingApp:
 
         mode_group = gui.CollapsableVert("モード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(mode_group)
+        mode_group.set_is_open(False)
 
         self.mode_combo = gui.Combobox()
         self.mode_combo.add_item(MODE_PLANE)
@@ -707,9 +711,11 @@ class PrimitiveFittingApp:
 
         outliner_group = gui.CollapsableVert("アウトライナー", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(outliner_group)
+        outliner_group.set_is_open(False)
 
-        self.outliner = gui.TreeView()
-        self.outliner.can_select_items_with_children = True
+        self.outliner = gui.ListView()
+        self.outliner.set_max_visible_items(8)
+        self.outliner.set_on_selection_changed(self._on_outliner_select)
         outliner_group.add_child(self.outliner)
 
         outliner_row = gui.Horiz(4)
@@ -726,6 +732,7 @@ class PrimitiveFittingApp:
 
         roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
+        roi_group.set_is_open(False)
 
         self.adaptive_roi_checkbox = gui.Checkbox("適応ROI")
         self.adaptive_roi_checkbox.checked = True
@@ -750,6 +757,7 @@ class PrimitiveFittingApp:
 
         fit_group = gui.CollapsableVert("平面/円柱パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(fit_group)
+        fit_group.set_is_open(False)
 
         self.plane_threshold = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.plane_threshold.double_value = 0.01
@@ -828,6 +836,7 @@ class PrimitiveFittingApp:
 
         consistency_group = gui.CollapsableVert("整合性/地面", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(consistency_group)
+        consistency_group.set_is_open(False)
 
         self.use_ground_plane = gui.Checkbox("地面平面を使う")
         self.use_ground_plane.checked = False
@@ -887,6 +896,7 @@ class PrimitiveFittingApp:
 
         stairs_group = gui.CollapsableVert("階段パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(stairs_group)
+        stairs_group.set_is_open(False)
 
         self.max_planes = gui.NumberEdit(gui.NumberEdit.INT)
         self.max_planes.int_value = 20
@@ -916,6 +926,7 @@ class PrimitiveFittingApp:
 
         output_group = gui.CollapsableVert("出力", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(output_group)
+        output_group.set_is_open(False)
 
         self.output_path_edit = gui.TextEdit()
         self.output_path_edit.text_value = self.output_path
@@ -935,6 +946,7 @@ class PrimitiveFittingApp:
 
         profile_group = gui.CollapsableVert("円柱プロファイル", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(profile_group)
+        profile_group.set_is_open(False)
 
         self.cylinder_profile_path = gui.TextEdit()
         self.cylinder_profile_path.text_value = "cylinder_profile.json"
@@ -953,8 +965,6 @@ class PrimitiveFittingApp:
             if key is not None:
                 self._apply_profile(key)
 
-        if self._outliner_root is None:
-            self._outliner_root = self.outliner.get_root_item()
 
     def _labeled_row(self, label: str, widget: gui.Widget) -> gui.Widget:
         row = gui.Horiz(4)
@@ -1153,9 +1163,9 @@ class PrimitiveFittingApp:
 
     def _reset_scene_objects(self):
         self.scene_widget.scene.clear_geometry()
-        for item_id in list(self._outliner_items.keys()):
-            self.outliner.remove_item(item_id)
-        self._outliner_items = {}
+        self._outliner_names = []
+        self.outliner.set_items([])
+        self._selected_outliner_index = -1
         self._objects = {}
         self._object_counter = 0
 
@@ -1195,13 +1205,9 @@ class PrimitiveFittingApp:
             except Exception:
                 obj["wire"] = None
 
-        if self._outliner_root is None:
-            self._outliner_root = self.outliner.get_root_item()
-        item_id = self.outliner.add_text_item(self._outliner_root, label)
-        self._outliner_items[item_id] = base_name
-        obj["item_id"] = item_id
-
         self._objects[base_name] = obj
+        self._outliner_names.append(base_name)
+        self.outliner.set_items([self._objects[n]["label"] for n in self._outliner_names])
         return base_name
 
     def _remove_object(self, name: str):
@@ -1214,11 +1220,10 @@ class PrimitiveFittingApp:
             self.scene_widget.scene.remove_geometry(str(solid_name))
         if wire_name:
             self.scene_widget.scene.remove_geometry(str(wire_name))
-        item_id = obj.get("item_id")
-        if item_id in self._outliner_items:
-            self.outliner.remove_item(int(item_id))
-            self._outliner_items.pop(int(item_id), None)
         self._objects.pop(name, None)
+        if name in self._outliner_names:
+            self._outliner_names.remove(name)
+            self.outliner.set_items([self._objects[n]["label"] for n in self._outliner_names])
 
     def _sync_object_visibility(self, name: str):
         obj = self._objects.get(name)
@@ -1239,8 +1244,10 @@ class PrimitiveFittingApp:
             self.scene_widget.scene.add_geometry(solid_name, obj["solid"], self._mesh_material if kind == "mesh" else self._pcd_material)
 
     def _on_toggle_visibility(self):
-        item = self.outliner.selected_item
-        name = self._outliner_items.get(item)
+        idx = int(self.outliner.selected_index)
+        if idx < 0 or idx >= len(self._outliner_names):
+            return
+        name = self._outliner_names[idx]
         if name is None:
             return
         obj = self._objects.get(name)
@@ -1250,8 +1257,10 @@ class PrimitiveFittingApp:
         self._sync_object_visibility(name)
 
     def _on_set_display_mode(self, mode: str):
-        item = self.outliner.selected_item
-        name = self._outliner_items.get(item)
+        idx = int(self.outliner.selected_index)
+        if idx < 0 or idx >= len(self._outliner_names):
+            return
+        name = self._outliner_names[idx]
         if name is None:
             return
         obj = self._objects.get(name)
@@ -1262,6 +1271,12 @@ class PrimitiveFittingApp:
         obj["mode"] = mode
         obj["visible"] = True if mode != "hidden" else False
         self._sync_object_visibility(name)
+
+    def _on_outliner_select(self, _value, _is_dbl_click=False):
+        try:
+            self._selected_outliner_index = int(self.outliner.selected_index)
+        except Exception:
+            self._selected_outliner_index = -1
 
     def _on_save_profile(self):
         path = self.cylinder_profile_path.text_value.strip()
