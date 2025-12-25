@@ -605,6 +605,8 @@ class PrimitiveFittingApp:
         self.all_points: Optional[np.ndarray] = None
         self.all_normals: Optional[np.ndarray] = None
         self._kdtree: Optional[o3d.geometry.KDTreeFlann] = None
+        self.ground_plane: Optional[PlaneParam] = None
+        self._ground_name: Optional[str] = None
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -787,6 +789,42 @@ class PrimitiveFittingApp:
         self.patch_shape.add_item(PATCH_SHAPE_LABELS["rect"])
         self.patch_shape.selected_text = PATCH_SHAPE_LABELS["hull"]
         fit_group.add_child(self._labeled_row("パッチ形状", self.patch_shape))
+
+        consistency_group = gui.CollapsableVert("整合性/地面", 0, gui.Margins(6, 6, 6, 6))
+        self.panel.add_child(consistency_group)
+
+        self.use_ground_plane = gui.Checkbox("地面平面を使う")
+        self.use_ground_plane.checked = False
+        consistency_group.add_child(self.use_ground_plane)
+
+        ground_row = gui.Horiz(4)
+        self.estimate_ground_button = gui.Button("地面推定")
+        self.estimate_ground_button.set_on_clicked(self._on_estimate_ground)
+        self.clear_ground_button = gui.Button("地面クリア")
+        self.clear_ground_button.set_on_clicked(self._on_clear_ground)
+        ground_row.add_child(self.estimate_ground_button)
+        ground_row.add_child(self.clear_ground_button)
+        consistency_group.add_child(ground_row)
+
+        self.ground_threshold = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.ground_threshold.double_value = 0.02
+        self.ground_ransac_n = gui.NumberEdit(gui.NumberEdit.INT)
+        self.ground_ransac_n.int_value = 3
+        self.ground_num_iterations = gui.NumberEdit(gui.NumberEdit.INT)
+        self.ground_num_iterations.int_value = 1000
+        self.ground_max_tilt = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.ground_max_tilt.double_value = 20.0
+        consistency_group.add_child(self._labeled_row("地面しきい値", self.ground_threshold))
+        consistency_group.add_child(self._labeled_row("地面RANSAC n", self.ground_ransac_n))
+        consistency_group.add_child(self._labeled_row("地面反復回数", self.ground_num_iterations))
+        consistency_group.add_child(self._labeled_row("地面最大傾斜角", self.ground_max_tilt))
+
+        self.cyl_vertical_constraint = gui.Checkbox("円柱の垂直制約")
+        self.cyl_vertical_constraint.checked = False
+        consistency_group.add_child(self.cyl_vertical_constraint)
+        self.cyl_vertical_deg = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.cyl_vertical_deg.double_value = 12.0
+        consistency_group.add_child(self._labeled_row("許容傾き(度)", self.cyl_vertical_deg))
 
         stairs_group = gui.CollapsableVert("階段パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(stairs_group)
@@ -993,6 +1031,7 @@ class PrimitiveFittingApp:
         self.scene_widget.look_at(center, center - [0, 0, 3], [0, -1, 0])
 
         self._clear_results()
+        self._clear_ground_plane()
         self._set_status(f"{len(self.all_points)}点を読み込みました。Shift+クリックで指定してください。")
 
     def _set_seed(self, center: np.ndarray):
@@ -1028,6 +1067,12 @@ class PrimitiveFittingApp:
             self.scene_widget.scene.remove_geometry(name)
         self._result_names = []
         self._result_meshes = []
+
+    def _clear_ground_plane(self):
+        if self._ground_name is not None:
+            self.scene_widget.scene.remove_geometry(self._ground_name)
+        self._ground_name = None
+        self.ground_plane = None
 
     def _run_fit(self):
         if self.pcd is None or self.all_points is None:
@@ -1126,6 +1171,8 @@ class PrimitiveFittingApp:
         if not self.keep_results_checkbox.checked:
             self._clear_results()
         self._maybe_autotune_cylinder()
+        if self.use_ground_plane.checked and self.ground_plane is None:
+            self._estimate_ground_plane()
         result = probe_cylinder_from_seed(
             self.all_points,
             seed_center,
@@ -1149,6 +1196,19 @@ class PrimitiveFittingApp:
         if not result.success or result.final is None:
             self._set_status(f"円柱抽出失敗: {result.message}")
             return
+
+        if self.cyl_vertical_constraint.checked:
+            if self.ground_plane is None:
+                self._set_status("地面平面が未推定です。")
+                return
+            axis = np.asarray(result.final.axis_direction, dtype=float)
+            axis = axis / max(np.linalg.norm(axis), 1e-9)
+            normal = np.asarray(self.ground_plane.normal, dtype=float)
+            normal = normal / max(np.linalg.norm(normal), 1e-9)
+            angle_deg = float(np.degrees(np.arccos(np.clip(abs(np.dot(axis, normal)), -1.0, 1.0))))
+            if angle_deg > float(self.cyl_vertical_deg.double_value):
+                self._set_status(f"円柱の傾きが大きいです: {angle_deg:.1f}°")
+                return
 
         cyl_mesh = create_cylinder_mesh(
             result.final.axis_point,
@@ -1207,6 +1267,74 @@ class PrimitiveFittingApp:
         elif height > 0.0:
             max_expand = float(height * 0.6)
             self.max_expand_radius.double_value = max(0.5, max_expand)
+
+    def _on_estimate_ground(self):
+        self._estimate_ground_plane()
+
+    def _on_clear_ground(self):
+        self._clear_ground_plane()
+        self._set_status("地面平面をクリアしました。")
+
+    def _estimate_ground_plane(self) -> None:
+        if self.pcd is None or self.all_points is None:
+            self._set_status("点群が読み込まれていません。")
+            return
+        try:
+            plane_model, inliers = self.pcd.segment_plane(
+                distance_threshold=float(self.ground_threshold.double_value),
+                ransac_n=int(self.ground_ransac_n.int_value),
+                num_iterations=int(self.ground_num_iterations.int_value),
+            )
+        except Exception as exc:
+            self._set_status(f"地面推定失敗: {exc}")
+            return
+
+        if len(inliers) == 0:
+            self._set_status("地面推定失敗: インライヤなし")
+            return
+
+        normal = np.asarray(plane_model[:3], dtype=float)
+        norm = float(np.linalg.norm(normal))
+        if not np.isfinite(norm) or norm < 1e-12:
+            self._set_status("地面推定失敗: 法線が不正")
+            return
+        normal = normal / norm
+        if normal[2] < 0:
+            normal = -normal
+
+        nz = float(np.clip(abs(normal[2]), -1.0, 1.0))
+        tilt_deg = float(np.degrees(np.arccos(nz)))
+        if tilt_deg > float(self.ground_max_tilt.double_value):
+            self._set_status(f"地面推定失敗: 傾斜が大きい ({tilt_deg:.1f}°)")
+            return
+
+        inlier_points = self.all_points[np.asarray(inliers, dtype=int)]
+        point = inlier_points.mean(axis=0)
+        plane = PlaneParam(
+            normal=normal,
+            point=point,
+            inlier_count=len(inliers),
+            inlier_indices=np.asarray(inliers, dtype=int),
+            height=float(point[2]),
+        )
+        self.ground_plane = plane
+
+        if self._ground_name is not None:
+            self.scene_widget.scene.remove_geometry(self._ground_name)
+        try:
+            mesh, _ = create_plane_patch_mesh(
+                plane,
+                self.all_points,
+                np.array([0.7, 0.2, 0.7]),
+                padding=0.05,
+                patch_shape=_patch_shape_value(self.patch_shape.selected_text),
+            )
+            self._ground_name = "ground_plane"
+            self.scene_widget.scene.add_geometry(self._ground_name, mesh, self._mesh_material)
+        except Exception:
+            self._ground_name = None
+
+        self._set_status(f"地面推定OK: 傾斜={tilt_deg:.1f}°, inliers={len(inliers)}")
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
         if not self.keep_results_checkbox.checked:
