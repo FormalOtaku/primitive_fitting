@@ -604,6 +604,7 @@ class PrimitiveFittingApp:
         self.pcd: Optional[o3d.geometry.PointCloud] = None
         self.all_points: Optional[np.ndarray] = None
         self.all_normals: Optional[np.ndarray] = None
+        self._kdtree: Optional[o3d.geometry.KDTreeFlann] = None
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -703,11 +704,14 @@ class PrimitiveFittingApp:
         self.roi_r_step.double_value = 0.1
         self.roi_min_points = gui.NumberEdit(gui.NumberEdit.INT)
         self.roi_min_points.int_value = 50
+        self.pick_snap_radius = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.pick_snap_radius.double_value = 0.05
 
         roi_group.add_child(self._labeled_row("r_min (最小半径)", self.roi_r_min))
         roi_group.add_child(self._labeled_row("r_max (最大半径)", self.roi_r_max))
         roi_group.add_child(self._labeled_row("r_step (増分)", self.roi_r_step))
         roi_group.add_child(self._labeled_row("最小点数", self.roi_min_points))
+        roi_group.add_child(self._labeled_row("クリックスナップ半径", self.pick_snap_radius))
 
         fit_group = gui.CollapsableVert("平面/円柱パラメータ", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(fit_group)
@@ -920,7 +924,11 @@ class PrimitiveFittingApp:
                 )
 
                 def update():
-                    self._set_seed(np.array(world, dtype=float))
+                    snapped = self._snap_to_point(np.array(world, dtype=float))
+                    if snapped is None:
+                        self._set_status("クリック位置の近くに点がありません。ズームして再クリックしてください。")
+                        return
+                    self._set_seed(snapped)
                     if self.auto_run_checkbox.checked:
                         self._run_fit()
 
@@ -956,6 +964,10 @@ class PrimitiveFittingApp:
 
         self.all_points = np.asarray(self.pcd.points)
         self.all_normals = np.asarray(self.pcd.normals) if self.pcd.has_normals() else None
+        try:
+            self._kdtree = o3d.geometry.KDTreeFlann(self.pcd)
+        except Exception:
+            self._kdtree = None
 
         self.scene_widget.scene.clear_geometry()
         self.scene_widget.scene.add_geometry("point_cloud", self.pcd, self._pcd_material)
@@ -972,13 +984,29 @@ class PrimitiveFittingApp:
         self.last_pick = np.asarray(center, dtype=float)
         if self._seed_name is not None:
             self.scene_widget.scene.remove_geometry(self._seed_name)
-        seed = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        snap_radius = float(self.pick_snap_radius.double_value)
+        radius = max(0.03, min(0.2, snap_radius if snap_radius > 0 else 0.05))
+        seed = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
         seed.paint_uniform_color([1.0, 0.8, 0.1])
         seed.translate(self.last_pick)
         seed.compute_vertex_normals()
         self._seed_name = "seed_marker"
         self.scene_widget.scene.add_geometry(self._seed_name, seed, self._mesh_material)
         self._set_status(f"シード選択: {np.round(self.last_pick, 4).tolist()}")
+
+    def _snap_to_point(self, world: np.ndarray) -> Optional[np.ndarray]:
+        if self._kdtree is None or self.all_points is None:
+            return world
+        try:
+            _, idx, dist2 = self._kdtree.search_knn_vector_3d(world, 1)
+            if not idx:
+                return None
+            snap_radius = float(self.pick_snap_radius.double_value)
+            if snap_radius > 0 and dist2[0] > snap_radius * snap_radius:
+                return None
+            return self.all_points[int(idx[0])]
+        except Exception:
+            return world
 
     def _clear_results(self):
         for name in self._result_names:
