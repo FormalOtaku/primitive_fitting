@@ -50,6 +50,18 @@ python main.py -i scan.pcd --voxel_size 0.02
 python main.py -i scan.ply --no_preprocess
 ```
 
+### Open3D GUI App（サイドパネル）
+
+Open3D のGUIでファイル選択・モード・パラメータをまとめて指定できます。
+
+```bash
+./venv/bin/python main.py --gui-app
+```
+
+- Shift+クリックで seed/ROI を選択（Auto-run をONにすると即実行）
+- Plane / Cylinder / Stairs をサイドパネルから切替
+- 各パラメータをGUIで調整して再実行可能
+
 ## Workflow
 
 1. 点群ファイルを読み込み、前処理（ダウンサンプリング、外れ値除去、法線推定）
