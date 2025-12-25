@@ -61,6 +61,7 @@ Open3D のGUIでファイル選択・モード・パラメータをまとめて�
 - Shift+クリックで seed/ROI を選択（Auto-run をONにすると即実行）
 - Plane / Cylinder / Stairs をサイドパネルから切替
 - 各パラメータをGUIで調整して再実行可能
+ - 文字化けする場合は `--gui-font` でフォント名 or フォントファイルを指定できます
 
 #### GUI操作方法
 
@@ -92,6 +93,18 @@ sudo apt-get install fonts-noto-cjk
 ```
 
 インストール後、GUIを再起動してください。
+
+フォントを明示指定する場合:
+
+```bash
+./venv/bin/python main.py --gui-app --gui-font NotoSansCJK
+```
+
+またはパス指定:
+
+```bash
+./venv/bin/python main.py --gui-app --gui-font /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+```
 
 ## Workflow
 

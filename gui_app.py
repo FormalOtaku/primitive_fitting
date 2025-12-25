@@ -498,31 +498,38 @@ def _patch_shape_value(text: str) -> str:
     return text if text in PATCH_SHAPE_LABELS else "hull"
 
 
-def _set_japanese_font(app: gui.Application) -> None:
+def _set_japanese_font(app: gui.Application, font_override: Optional[str] = None) -> None:
     """Install a CJK-capable font for Japanese UI labels if available."""
-    candidates = [
+    candidates: List[str] = []
+    if font_override:
+        candidates.append(font_override)
+    candidates += [
+        "NotoSansCJK",
+        "Noto Sans CJK JP",
+        "NotoSansCJKJP",
+        "Noto Sans CJK",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Medium.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
     ]
-    font_path = None
-    for path in candidates:
-        if Path(path).exists():
-            font_path = path
-            break
-    if font_path is None:
-        print("Warning: 日本語フォントが見つかりません。GUI表示が文字化けする可能性があります。")
-        return
 
-    try:
-        font_desc = gui.FontDescription()
-        font_desc.add_typeface_for_language("ja", font_path)
-        app.set_font(app.DEFAULT_FONT_ID, font_desc)
-    except Exception as exc:
-        print(f"Warning: 日本語フォント設定に失敗しました: {exc}")
+    for typeface in candidates:
+        if typeface.startswith("/") and not Path(typeface).exists():
+            continue
+        try:
+            font_desc = gui.FontDescription()
+            font_desc.add_typeface_for_language(typeface, "ja")
+            app.set_font(app.DEFAULT_FONT_ID, font_desc)
+            return
+        except Exception:
+            continue
+
+    print(
+        "Warning: 日本語フォントが見つかりません。"
+        "GUI表示が文字化けする可能性があります。"
+    )
 
 
 # =============================================================================
@@ -1205,7 +1212,8 @@ def _combine_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> o3d.geometry.Tri
 def launch_gui(args=None):
     app = gui.Application.instance
     app.initialize()
-    _set_japanese_font(app)
+    font_override = getattr(args, "gui_font", None) if args is not None else None
+    _set_japanese_font(app, font_override=font_override)
     initial_path = None
     initial_profile = None
     output_path = "fit_results.json"
