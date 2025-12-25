@@ -589,22 +589,27 @@ class PrimitiveFittingApp:
         self._line_material = rendering.MaterialRecord()
         self._line_material.shader = "unlitLine"
         self._line_material.line_width = 1.0 * self.window.scaling
+        self._drag_rect_material = rendering.MaterialRecord()
+        self._drag_rect_material.shader = "unlitLine"
+        self._drag_rect_material.line_width = 2.0 * self.window.scaling
 
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
         self.scene_widget.scene.set_background([0.02, 0.02, 0.02, 1.0])
         self.scene_widget.set_on_mouse(self._on_mouse)
+        self.scene_widget.set_view_controls(gui.SceneWidget.Controls.ROTATE_CAMERA)
         self.window.add_child(self.scene_widget)
 
         self.axes_widget = gui.SceneWidget()
         self.axes_widget.scene = rendering.Open3DScene(self.window.renderer)
         self.axes_widget.scene.set_background([0.1, 0.1, 0.1, 1.0])
-        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
         self.axes_widget.scene.add_geometry("axes", axes, self._mesh_material)
         self.window.add_child(self.axes_widget)
 
         self.panel = gui.ScrollableVert(0, gui.Margins(8, 8, 8, 8))
         self.window.add_child(self.panel)
+        self.window.set_on_key(self._on_key)
 
         self._rng = np.random.default_rng(1234)
 
@@ -633,9 +638,8 @@ class PrimitiveFittingApp:
         self._edit_mask: Optional[np.ndarray] = None
         self._edit_history: List[np.ndarray] = []
         self._current_indices: Optional[np.ndarray] = None
-        self._drag_start: Optional[Tuple[int, int]] = None
-        self._drag_end: Optional[Tuple[int, int]] = None
-        self._dragging: bool = False
+        self._box_select_start: Optional[Tuple[int, int]] = None
+        self._drag_rect_name: Optional[str] = None
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -988,7 +992,13 @@ class PrimitiveFittingApp:
 
         self.edit_mode = gui.Checkbox("編集モード（Shift+クリックで削除）")
         self.edit_mode.checked = False
+        self.edit_mode.set_on_checked(self._on_edit_mode_toggle)
         edit_group.add_child(self.edit_mode)
+
+        self.box_select_mode = gui.Checkbox("矩形削除モード（2クリック）")
+        self.box_select_mode.checked = False
+        self.box_select_mode.set_on_checked(self._on_box_select_toggle)
+        edit_group.add_child(self.box_select_mode)
 
         self.edit_radius = gui.NumberEdit(gui.NumberEdit.DOUBLE)
         self.edit_radius.double_value = 0.10
@@ -1006,6 +1016,7 @@ class PrimitiveFittingApp:
         self._fit_group = fit_group
         self._stairs_group = stairs_group
         self._update_mode_visibility()
+        self._update_view_controls()
 
         if self.profile_combo.selected_text != PROFILE_CUSTOM_LABEL:
             key = _profile_key_from_display(self.profile_combo.selected_text)
@@ -1024,7 +1035,7 @@ class PrimitiveFittingApp:
         panel_width = int(360 * self.window.scaling)
         self.scene_widget.frame = gui.Rect(r.x, r.y, r.width - panel_width, r.height)
         self.panel.frame = gui.Rect(r.get_right() - panel_width, r.y, panel_width, r.height)
-        axes_size = int(120 * self.window.scaling)
+        axes_size = int(160 * self.window.scaling)
         self.axes_widget.frame = gui.Rect(r.x + 8, r.y + 8, axes_size, axes_size)
 
     def _on_open_dialog(self):
@@ -1089,29 +1100,39 @@ class PrimitiveFittingApp:
         self._set_status("結果をクリアしました。")
 
     def _on_mouse(self, event):
-        if event.is_modifier_down(gui.KeyModifier.SHIFT):
-            if self.edit_mode.checked:
-                if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
-                    self._drag_start = (int(event.x), int(event.y))
-                    self._drag_end = None
-                    self._dragging = True
+        shift_down = event.is_modifier_down(gui.KeyModifier.SHIFT)
+        if self.edit_mode.checked and self.box_select_mode.checked:
+            if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
+                if not event.is_button_down(gui.MouseButton.LEFT):
                     return gui.Widget.EventCallbackResult.HANDLED
-                if event.type == gui.MouseEvent.Type.DRAG and self._dragging:
-                    self._drag_end = (int(event.x), int(event.y))
+                x_local, y_local, inside = self._event_to_widget_coords(event)
+                if not inside:
                     return gui.Widget.EventCallbackResult.HANDLED
-                if event.type == gui.MouseEvent.Type.BUTTON_UP and self._dragging:
-                    self._dragging = False
-                    start = self._drag_start
-                    end = self._drag_end or (int(event.x), int(event.y))
-                    if start is None:
-                        return gui.Widget.EventCallbackResult.HANDLED
+                if self._box_select_start is None:
+                    self._box_select_start = (x_local, y_local)
+                    self._update_drag_rect(self._box_select_start, self._box_select_start)
+                    self._set_status("矩形削除: 2点目をクリックしてください")
+                else:
+                    start = self._box_select_start
+                    end = (x_local, y_local)
+                    self._box_select_start = None
+                    self._clear_drag_rect()
                     dx = abs(end[0] - start[0])
                     dy = abs(end[1] - start[1])
-                    if max(dx, dy) < 4:
-                        self._handle_shift_click(event)
-                    else:
-                        self._erase_points_in_rect(start, end)
-                    return gui.Widget.EventCallbackResult.HANDLED
+                    if max(dx, dy) >= 4:
+                        gui.Application.instance.post_to_main_thread(
+                            self.window,
+                            lambda s=start, e=end: self._erase_points_in_rect(s, e)
+                        )
+                return gui.Widget.EventCallbackResult.HANDLED
+            if event.type == gui.MouseEvent.Type.MOVE and self._box_select_start is not None:
+                x_local, y_local, inside = self._event_to_widget_coords(event)
+                if inside:
+                    self._update_drag_rect(self._box_select_start, (x_local, y_local))
+                return gui.Widget.EventCallbackResult.HANDLED
+            if event.type in (gui.MouseEvent.Type.DRAG, gui.MouseEvent.Type.BUTTON_UP, gui.MouseEvent.Type.WHEEL):
+                return gui.Widget.EventCallbackResult.HANDLED
+        if shift_down:
             if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
                 self._handle_shift_click(event)
                 return gui.Widget.EventCallbackResult.HANDLED
@@ -1119,16 +1140,43 @@ class PrimitiveFittingApp:
             self._sync_axes_camera()
         return gui.Widget.EventCallbackResult.IGNORED
 
+    def _on_key(self, event):
+        if event.type == gui.KeyEvent.Type.DOWN:
+            if event.key == gui.KeyName.B and self.edit_mode.checked:
+                self.box_select_mode.checked = not self.box_select_mode.checked
+                self._update_view_controls()
+                state = "ON" if self.box_select_mode.checked else "OFF"
+                self._set_status(f"矩形削除モード: {state}（Bキー）")
+                return gui.Widget.EventCallbackResult.HANDLED
+        return gui.Widget.EventCallbackResult.IGNORED
+
+    def _on_box_select_toggle(self, is_checked: bool):
+        _ = is_checked
+        if not is_checked:
+            self._box_select_start = None
+            self._clear_drag_rect()
+        self._update_view_controls()
+
+    def _on_edit_mode_toggle(self, is_checked: bool):
+        if not is_checked:
+            self.box_select_mode.checked = False
+            self._clear_drag_rect()
+            self._box_select_start = None
+        self._update_view_controls()
+
+    def _update_view_controls(self):
+        self.scene_widget.set_view_controls(gui.SceneWidget.Controls.ROTATE_CAMERA)
+
     def _handle_shift_click(self, event):
         if event.type != gui.MouseEvent.Type.BUTTON_DOWN:
             return
-        if not (self.scene_widget.frame.x <= event.x <= self.scene_widget.frame.get_right() and
-                self.scene_widget.frame.y <= event.y <= self.scene_widget.frame.get_bottom()):
+        x_local, y_local, inside = self._event_to_widget_coords(event)
+        if not inside:
             return
         if self.edit_mode.checked:
             def depth_callback(depth_image):
-                x = int(event.x - self.scene_widget.frame.x)
-                y = int(event.y - self.scene_widget.frame.y)
+                x = x_local
+                y = y_local
                 if x < 0 or y < 0 or x >= self.scene_widget.frame.width or y >= self.scene_widget.frame.height:
                     return
                 depth = np.asarray(depth_image)[y, x]
@@ -1307,11 +1355,6 @@ class PrimitiveFittingApp:
         x_min, x_max = sorted([x0, x1])
         y_min, y_max = sorted([y0, y1])
 
-        # Convert to widget-local coords
-        x_min -= int(self.scene_widget.frame.x)
-        x_max -= int(self.scene_widget.frame.x)
-        y_min -= int(self.scene_widget.frame.y)
-        y_max -= int(self.scene_widget.frame.y)
         if x_max < 0 or y_max < 0 or x_min >= self.scene_widget.frame.width or y_min >= self.scene_widget.frame.height:
             self._set_status("選択範囲がビュー外です。")
             return
@@ -1339,6 +1382,58 @@ class PrimitiveFittingApp:
         self._update_point_cloud_view()
         self._set_status(f"{len(idx_global)}点を削除しました（元データは保持）")
 
+    def _update_drag_rect(self, start: Tuple[int, int], end: Tuple[int, int]):
+        if start is None or end is None:
+            return
+        width = int(self.scene_widget.frame.width)
+        height = int(self.scene_widget.frame.height)
+        if width <= 1 or height <= 1:
+            return
+        x_min = max(0, min(width - 1, min(start[0], end[0])))
+        x_max = max(0, min(width - 1, max(start[0], end[0])))
+        y_min = max(0, min(height - 1, min(start[1], end[1])))
+        y_max = max(0, min(height - 1, max(start[1], end[1])))
+        if x_max <= x_min or y_max <= y_min:
+            return
+        depth = 0.02
+        camera = self.scene_widget.scene.camera
+        try:
+            c0 = camera.unproject(x_min, y_min, depth, width, height)
+            c1 = camera.unproject(x_max, y_min, depth, width, height)
+            c2 = camera.unproject(x_max, y_max, depth, width, height)
+            c3 = camera.unproject(x_min, y_max, depth, width, height)
+        except Exception:
+            return
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector([c0, c1, c2, c3])
+        line_set.lines = o3d.utility.Vector2iVector([[0, 1], [1, 2], [2, 3], [3, 0]])
+        line_set.colors = o3d.utility.Vector3dVector([[1.0, 0.6, 0.2]] * 4)
+        name = "__drag_rect__"
+        if self.scene_widget.scene.has_geometry(name):
+            self.scene_widget.scene.remove_geometry(name)
+        self.scene_widget.scene.add_geometry(name, line_set, self._drag_rect_material)
+        self._drag_rect_name = name
+        self.scene_widget.force_redraw()
+
+    def _clear_drag_rect(self):
+        if self._drag_rect_name and self.scene_widget.scene.has_geometry(self._drag_rect_name):
+            self.scene_widget.scene.remove_geometry(self._drag_rect_name)
+        self._drag_rect_name = None
+
+    def _event_to_widget_coords(self, event, widget: Optional[gui.Widget] = None) -> Tuple[int, int, bool]:
+        if widget is None:
+            widget = self.scene_widget
+        x = int(event.x)
+        y = int(event.y)
+        width = int(widget.frame.width)
+        height = int(widget.frame.height)
+        if 0 <= x < width and 0 <= y < height:
+            return x, y, True
+        x_local = x - int(widget.frame.x)
+        y_local = y - int(widget.frame.y)
+        inside = 0 <= x_local < width and 0 <= y_local < height
+        return x_local, y_local, inside
+
     def _project_points_to_screen(self, points: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if points is None or len(points) == 0:
             return None, None
@@ -1346,21 +1441,37 @@ class PrimitiveFittingApp:
         height = int(self.scene_widget.frame.height)
         if width <= 1 or height <= 1:
             return None, None
-        view = np.asarray(self.scene_widget.scene.camera.get_view_matrix(), dtype=float)
-        proj = np.asarray(self.scene_widget.scene.camera.get_projection_matrix(width, height), dtype=float)
-        pts = np.asarray(points, dtype=float)
-        ones = np.ones((len(pts), 1), dtype=float)
-        pts_h = np.hstack([pts, ones])
-        clip = (pts_h @ view.T) @ proj.T
-        w = clip[:, 3]
-        valid = w > 1e-8
-        ndc = np.zeros((len(pts), 3), dtype=float)
-        ndc[valid] = clip[valid, :3] / w[valid, None]
-        z_ok = (ndc[:, 2] >= -1.0) & (ndc[:, 2] <= 1.0)
-        valid &= z_ok
-        xs = (ndc[:, 0] + 1.0) * 0.5 * width
-        ys = (1.0 - ndc[:, 1]) * 0.5 * height
-        coords = np.column_stack([xs, ys])
+        view = np.asarray(self.scene_widget.scene.camera.get_view_matrix(), dtype=np.float32)
+        camera = self.scene_widget.scene.camera
+        try:
+            proj = np.asarray(camera.get_projection_matrix(width, height), dtype=np.float32)
+        except TypeError:
+            proj = np.asarray(camera.get_projection_matrix(), dtype=np.float32)
+        if not (np.isfinite(view).all() and np.isfinite(proj).all()):
+            return None, None
+        pts = np.asarray(points, dtype=np.float32)
+        n = len(pts)
+        coords = np.empty((n, 2), dtype=np.float32)
+        valid = np.zeros(n, dtype=bool)
+        batch = 200000
+        for start in range(0, n, batch):
+            end = min(start + batch, n)
+            chunk = pts[start:end]
+            ones = np.ones((len(chunk), 1), dtype=np.float32)
+            pts_h = np.hstack([chunk, ones])
+            clip = (pts_h @ view.T) @ proj.T
+            w = clip[:, 3]
+            v = w > 1e-6
+            ndc = np.zeros((len(chunk), 3), dtype=np.float32)
+            if np.any(v):
+                ndc[v] = clip[v, :3] / w[v, None]
+            z_ok = (ndc[:, 2] >= -1.0) & (ndc[:, 2] <= 1.0)
+            v &= z_ok
+            xs = (ndc[:, 0] + 1.0) * 0.5 * width
+            ys = (1.0 - ndc[:, 1]) * 0.5 * height
+            coords[start:end, 0] = xs
+            coords[start:end, 1] = ys
+            valid[start:end] = v
         return coords, valid
 
     def _ensure_grid(self):
