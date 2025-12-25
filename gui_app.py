@@ -595,10 +595,18 @@ class PrimitiveFittingApp:
 
         self._mesh_material = rendering.MaterialRecord()
         self._mesh_material.shader = "defaultLit"
+        self._line_material = rendering.MaterialRecord()
+        self._line_material.shader = "unlitLine"
+        self._line_material.line_width = 1.0 * self.window.scaling
 
         self._result_names: List[str] = []
         self._result_meshes: List[o3d.geometry.TriangleMesh] = []
         self._seed_name: Optional[str] = None
+
+        self._objects: Dict[str, Dict[str, object]] = {}
+        self._outliner_items: Dict[int, str] = {}
+        self._outliner_root: Optional[int] = None
+        self._object_counter = 0
 
         self.pcd_raw: Optional[o3d.geometry.PointCloud] = None
         self.pcd: Optional[o3d.geometry.PointCloud] = None
@@ -607,6 +615,8 @@ class PrimitiveFittingApp:
         self._kdtree: Optional[o3d.geometry.KDTreeFlann] = None
         self.ground_plane: Optional[PlaneParam] = None
         self._ground_name: Optional[str] = None
+        self.ceiling_plane: Optional[PlaneParam] = None
+        self._ceiling_name: Optional[str] = None
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -695,6 +705,25 @@ class PrimitiveFittingApp:
         run_row.add_child(self.clear_button)
         mode_group.add_child(run_row)
 
+        outliner_group = gui.CollapsableVert("アウトライナー", 0, gui.Margins(6, 6, 6, 6))
+        self.panel.add_child(outliner_group)
+
+        self.outliner = gui.TreeView()
+        self.outliner.can_select_items_with_children = True
+        outliner_group.add_child(self.outliner)
+
+        outliner_row = gui.Horiz(4)
+        self.outliner_toggle_button = gui.Button("表示/非表示")
+        self.outliner_toggle_button.set_on_clicked(self._on_toggle_visibility)
+        self.outliner_solid_button = gui.Button("ソリッド")
+        self.outliner_solid_button.set_on_clicked(lambda: self._on_set_display_mode("solid"))
+        self.outliner_wire_button = gui.Button("ワイヤ")
+        self.outliner_wire_button.set_on_clicked(lambda: self._on_set_display_mode("wire"))
+        outliner_row.add_child(self.outliner_toggle_button)
+        outliner_row.add_child(self.outliner_solid_button)
+        outliner_row.add_child(self.outliner_wire_button)
+        outliner_group.add_child(outliner_row)
+
         roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
 
@@ -743,6 +772,13 @@ class PrimitiveFittingApp:
         self.target_height.double_value = 0.0
         fit_group.add_child(self._labeled_row("想定直径(m)", self.target_diameter))
         fit_group.add_child(self._labeled_row("想定高さ(m)", self.target_height))
+
+        self.target_diameter_tol = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.target_diameter_tol.double_value = 0.0
+        self.target_height_tol = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.target_height_tol.double_value = 0.0
+        fit_group.add_child(self._labeled_row("直径許容(±m)", self.target_diameter_tol))
+        fit_group.add_child(self._labeled_row("高さ許容(±m)", self.target_height_tol))
 
         self.expand_method = gui.Combobox()
         self.expand_method.add_item(EXPAND_METHOD_LABELS["component"])
@@ -819,6 +855,29 @@ class PrimitiveFittingApp:
         consistency_group.add_child(self._labeled_row("地面反復回数", self.ground_num_iterations))
         consistency_group.add_child(self._labeled_row("地面最大傾斜角", self.ground_max_tilt))
 
+        self.use_ceiling_plane = gui.Checkbox("天井平面を使う")
+        self.use_ceiling_plane.checked = False
+        consistency_group.add_child(self.use_ceiling_plane)
+
+        ceiling_row = gui.Horiz(4)
+        self.estimate_ceiling_button = gui.Button("天井推定")
+        self.estimate_ceiling_button.set_on_clicked(self._on_estimate_ceiling)
+        self.clear_ceiling_button = gui.Button("天井クリア")
+        self.clear_ceiling_button.set_on_clicked(self._on_clear_ceiling)
+        ceiling_row.add_child(self.estimate_ceiling_button)
+        ceiling_row.add_child(self.clear_ceiling_button)
+        consistency_group.add_child(ceiling_row)
+
+        self.ceiling_threshold = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.ceiling_threshold.double_value = 0.02
+        self.ceiling_max_tilt = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.ceiling_max_tilt.double_value = 20.0
+        self.ceiling_min_ratio = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.ceiling_min_ratio.double_value = 0.7
+        consistency_group.add_child(self._labeled_row("天井しきい値", self.ceiling_threshold))
+        consistency_group.add_child(self._labeled_row("天井最大傾斜角", self.ceiling_max_tilt))
+        consistency_group.add_child(self._labeled_row("天井下限比率", self.ceiling_min_ratio))
+
         self.cyl_vertical_constraint = gui.Checkbox("円柱の垂直制約")
         self.cyl_vertical_constraint.checked = False
         consistency_group.add_child(self.cyl_vertical_constraint)
@@ -874,6 +933,17 @@ class PrimitiveFittingApp:
         self.auto_save_checkbox.checked = True
         output_group.add_child(self.auto_save_checkbox)
 
+        profile_group = gui.CollapsableVert("円柱プロファイル", 0, gui.Margins(6, 6, 6, 6))
+        self.panel.add_child(profile_group)
+
+        self.cylinder_profile_path = gui.TextEdit()
+        self.cylinder_profile_path.text_value = "cylinder_profile.json"
+        profile_group.add_child(self._labeled_row("保存先JSON", self.cylinder_profile_path))
+
+        self.save_profile_button = gui.Button("プロファイル保存")
+        self.save_profile_button.set_on_clicked(self._on_save_profile)
+        profile_group.add_child(self.save_profile_button)
+
         self._fit_group = fit_group
         self._stairs_group = stairs_group
         self._update_mode_visibility()
@@ -882,6 +952,9 @@ class PrimitiveFittingApp:
             key = _profile_key_from_display(self.profile_combo.selected_text)
             if key is not None:
                 self._apply_profile(key)
+
+        if self._outliner_root is None:
+            self._outliner_root = self.outliner.get_root_item()
 
     def _labeled_row(self, label: str, widget: gui.Widget) -> gui.Widget:
         row = gui.Horiz(4)
@@ -1022,8 +1095,13 @@ class PrimitiveFittingApp:
         except Exception:
             self._kdtree = None
 
-        self.scene_widget.scene.clear_geometry()
-        self.scene_widget.scene.add_geometry("point_cloud", self.pcd, self._pcd_material)
+        self._reset_scene_objects()
+        self._register_object(
+            label="点群",
+            geometry=self.pcd,
+            kind="pcd",
+            category="base",
+        )
 
         bounds = self.scene_widget.scene.bounding_box
         center = bounds.get_center()
@@ -1032,6 +1110,7 @@ class PrimitiveFittingApp:
 
         self._clear_results()
         self._clear_ground_plane()
+        self._clear_ceiling_plane()
         self._set_status(f"{len(self.all_points)}点を読み込みました。Shift+クリックで指定してください。")
 
     def _set_seed(self, center: np.ndarray):
@@ -1063,16 +1142,175 @@ class PrimitiveFittingApp:
             return world
 
     def _clear_results(self):
-        for name in self._result_names:
-            self.scene_widget.scene.remove_geometry(name)
+        to_remove = [
+            name for name, obj in self._objects.items()
+            if obj.get("category") == "result"
+        ]
+        for name in to_remove:
+            self._remove_object(name)
         self._result_names = []
         self._result_meshes = []
 
+    def _reset_scene_objects(self):
+        self.scene_widget.scene.clear_geometry()
+        for item_id in list(self._outliner_items.keys()):
+            self.outliner.remove_item(item_id)
+        self._outliner_items = {}
+        self._objects = {}
+        self._object_counter = 0
+
+    def _register_object(
+        self,
+        *,
+        label: str,
+        geometry: o3d.geometry.Geometry,
+        kind: str,
+        category: str,
+    ) -> str:
+        self._object_counter += 1
+        base_name = f"{category}_{self._object_counter}"
+        solid_name = base_name
+        wire_name = f"{base_name}_wire"
+
+        obj: Dict[str, object] = {
+            "label": label,
+            "kind": kind,
+            "category": category,
+            "solid_name": solid_name,
+            "wire_name": wire_name,
+            "solid": geometry,
+            "wire": None,
+            "mode": "solid",
+            "visible": True,
+        }
+
+        if kind == "pcd":
+            self.scene_widget.scene.add_geometry(solid_name, geometry, self._pcd_material)
+        else:
+            self.scene_widget.scene.add_geometry(solid_name, geometry, self._mesh_material)
+            try:
+                line = o3d.geometry.LineSet.create_from_triangle_mesh(geometry)
+                line.paint_uniform_color((0.9, 0.9, 0.9))
+                obj["wire"] = line
+            except Exception:
+                obj["wire"] = None
+
+        if self._outliner_root is None:
+            self._outliner_root = self.outliner.get_root_item()
+        item_id = self.outliner.add_text_item(self._outliner_root, label)
+        self._outliner_items[item_id] = base_name
+        obj["item_id"] = item_id
+
+        self._objects[base_name] = obj
+        return base_name
+
+    def _remove_object(self, name: str):
+        obj = self._objects.get(name)
+        if obj is None:
+            return
+        solid_name = obj.get("solid_name")
+        wire_name = obj.get("wire_name")
+        if solid_name:
+            self.scene_widget.scene.remove_geometry(str(solid_name))
+        if wire_name:
+            self.scene_widget.scene.remove_geometry(str(wire_name))
+        item_id = obj.get("item_id")
+        if item_id in self._outliner_items:
+            self.outliner.remove_item(int(item_id))
+            self._outliner_items.pop(int(item_id), None)
+        self._objects.pop(name, None)
+
+    def _sync_object_visibility(self, name: str):
+        obj = self._objects.get(name)
+        if obj is None:
+            return
+        solid_name = str(obj.get("solid_name"))
+        wire_name = str(obj.get("wire_name"))
+        self.scene_widget.scene.remove_geometry(solid_name)
+        if wire_name:
+            self.scene_widget.scene.remove_geometry(wire_name)
+        if not obj.get("visible", True):
+            return
+        mode = obj.get("mode", "solid")
+        kind = obj.get("kind")
+        if mode == "wire" and kind == "mesh" and obj.get("wire") is not None:
+            self.scene_widget.scene.add_geometry(wire_name, obj["wire"], self._line_material)
+        else:
+            self.scene_widget.scene.add_geometry(solid_name, obj["solid"], self._mesh_material if kind == "mesh" else self._pcd_material)
+
+    def _on_toggle_visibility(self):
+        item = self.outliner.selected_item
+        name = self._outliner_items.get(item)
+        if name is None:
+            return
+        obj = self._objects.get(name)
+        if obj is None:
+            return
+        obj["visible"] = not bool(obj.get("visible", True))
+        self._sync_object_visibility(name)
+
+    def _on_set_display_mode(self, mode: str):
+        item = self.outliner.selected_item
+        name = self._outliner_items.get(item)
+        if name is None:
+            return
+        obj = self._objects.get(name)
+        if obj is None:
+            return
+        if mode == "wire" and obj.get("kind") != "mesh":
+            return
+        obj["mode"] = mode
+        obj["visible"] = True if mode != "hidden" else False
+        self._sync_object_visibility(name)
+
+    def _on_save_profile(self):
+        path = self.cylinder_profile_path.text_value.strip()
+        if not path:
+            self._set_status("保存先が空です。")
+            return
+        profile = {
+            "target": {
+                "diameter": float(self.target_diameter.double_value),
+                "height": float(self.target_height.double_value),
+                "diameter_tol": float(self.target_diameter_tol.double_value),
+                "height_tol": float(self.target_height_tol.double_value),
+            },
+            "roi": {
+                "r_min": float(self.roi_r_min.double_value),
+                "r_max": float(self.roi_r_max.double_value),
+                "r_step": float(self.roi_r_step.double_value),
+                "min_points": int(self.roi_min_points.int_value),
+            },
+            "cylinder": {
+                "threshold": float(self.cylinder_threshold.double_value),
+                "normal_deg": float(self.normal_th.double_value),
+                "grow_radius": float(self.grow_radius.double_value),
+                "max_expand_radius": float(self.max_expand_radius.double_value),
+                "max_refine_iters": int(self.max_refine_iters.int_value),
+                "max_expanded_points": int(self.max_expanded_points.int_value),
+                "max_frontier": int(self.max_frontier.int_value),
+                "max_steps": int(self.max_steps.int_value),
+            },
+        }
+        try:
+            with open(path, "w") as f:
+                json.dump(profile, f, indent=2)
+        except Exception as exc:
+            self._set_status(f"保存失敗: {exc}")
+            return
+        self._set_status(f"プロファイル保存: {path}")
+
     def _clear_ground_plane(self):
         if self._ground_name is not None:
-            self.scene_widget.scene.remove_geometry(self._ground_name)
+            self._remove_object(self._ground_name)
         self._ground_name = None
         self.ground_plane = None
+
+    def _clear_ceiling_plane(self):
+        if self._ceiling_name is not None:
+            self._remove_object(self._ceiling_name)
+        self._ceiling_name = None
+        self.ceiling_plane = None
 
     def _run_fit(self):
         if self.pcd is None or self.all_points is None:
@@ -1155,8 +1393,13 @@ class PrimitiveFittingApp:
             self._set_status(f"平面パッチ生成失敗: {exc}")
             return
 
-        name = "plane_result"
-        self.scene_widget.scene.add_geometry(name, mesh, self._mesh_material)
+        label = f"平面 {len(self._result_names) + 1}"
+        name = self._register_object(
+            label=label,
+            geometry=mesh,
+            kind="mesh",
+            category="result",
+        )
         self._result_names.append(name)
         self._result_meshes.append(mesh)
 
@@ -1173,6 +1416,8 @@ class PrimitiveFittingApp:
         self._maybe_autotune_cylinder()
         if self.use_ground_plane.checked and self.ground_plane is None:
             self._estimate_ground_plane()
+        if self.use_ceiling_plane.checked and self.ceiling_plane is None:
+            self._estimate_ceiling_plane()
         result = probe_cylinder_from_seed(
             self.all_points,
             seed_center,
@@ -1197,6 +1442,26 @@ class PrimitiveFittingApp:
             self._set_status(f"円柱抽出失敗: {result.message}")
             return
 
+        target_d = float(self.target_diameter.double_value)
+        tol_d = float(self.target_diameter_tol.double_value)
+        if target_d > 0.0 and tol_d > 0.0:
+            diameter = float(result.final.radius) * 2.0
+            if abs(diameter - target_d) > tol_d:
+                self._set_status(
+                    f"円柱直径が範囲外: {diameter:.3f}m (許容±{tol_d:.3f}m)"
+                )
+                return
+
+        target_h = float(self.target_height.double_value)
+        tol_h = float(self.target_height_tol.double_value)
+        if target_h > 0.0 and tol_h > 0.0:
+            length = float(result.final.length)
+            if abs(length - target_h) > tol_h:
+                self._set_status(
+                    f"円柱高さが範囲外: {length:.3f}m (許容±{tol_h:.3f}m)"
+                )
+                return
+
         if self.cyl_vertical_constraint.checked:
             if self.ground_plane is None:
                 self._set_status("地面平面が未推定です。")
@@ -1220,8 +1485,13 @@ class PrimitiveFittingApp:
             self._set_status("円柱メッシュ生成失敗")
             return
 
-        name = "cylinder_result"
-        self.scene_widget.scene.add_geometry(name, cyl_mesh, self._mesh_material)
+        label = f"円柱 {len(self._result_names) + 1}"
+        name = self._register_object(
+            label=label,
+            geometry=cyl_mesh,
+            kind="mesh",
+            category="result",
+        )
         self._result_names.append(name)
         self._result_meshes.append(cyl_mesh)
 
@@ -1275,6 +1545,13 @@ class PrimitiveFittingApp:
         self._clear_ground_plane()
         self._set_status("地面平面をクリアしました。")
 
+    def _on_estimate_ceiling(self):
+        self._estimate_ceiling_plane()
+
+    def _on_clear_ceiling(self):
+        self._clear_ceiling_plane()
+        self._set_status("天井平面をクリアしました。")
+
     def _estimate_ground_plane(self) -> None:
         if self.pcd is None or self.all_points is None:
             self._set_status("点群が読み込まれていません。")
@@ -1320,7 +1597,7 @@ class PrimitiveFittingApp:
         self.ground_plane = plane
 
         if self._ground_name is not None:
-            self.scene_widget.scene.remove_geometry(self._ground_name)
+            self._remove_object(self._ground_name)
         try:
             mesh, _ = create_plane_patch_mesh(
                 plane,
@@ -1329,12 +1606,99 @@ class PrimitiveFittingApp:
                 padding=0.05,
                 patch_shape=_patch_shape_value(self.patch_shape.selected_text),
             )
-            self._ground_name = "ground_plane"
-            self.scene_widget.scene.add_geometry(self._ground_name, mesh, self._mesh_material)
+            self._ground_name = self._register_object(
+                label="地面",
+                geometry=mesh,
+                kind="mesh",
+                category="ground",
+            )
         except Exception:
             self._ground_name = None
 
         self._set_status(f"地面推定OK: 傾斜={tilt_deg:.1f}°, inliers={len(inliers)}")
+
+    def _estimate_ceiling_plane(self) -> None:
+        if self.all_points is None or self.pcd is None:
+            self._set_status("点群が読み込まれていません。")
+            return
+        z_vals = self.all_points[:, 2]
+        if z_vals.size == 0:
+            self._set_status("天井推定失敗: 点がありません")
+            return
+        ratio = float(self.ceiling_min_ratio.double_value)
+        ratio = max(0.1, min(0.95, ratio))
+        z_min = float(z_vals.min())
+        z_max = float(z_vals.max())
+        z_thr = z_min + ratio * (z_max - z_min)
+        mask = z_vals >= z_thr
+        idx = np.where(mask)[0]
+        if len(idx) < 50:
+            self._set_status("天井推定失敗: 上部点が少なすぎます")
+            return
+        subset = self.all_points[idx]
+        pcd_sub = o3d.geometry.PointCloud()
+        pcd_sub.points = o3d.utility.Vector3dVector(subset)
+        try:
+            plane_model, inliers = pcd_sub.segment_plane(
+                distance_threshold=float(self.ceiling_threshold.double_value),
+                ransac_n=int(self.ground_ransac_n.int_value),
+                num_iterations=int(self.ground_num_iterations.int_value),
+            )
+        except Exception as exc:
+            self._set_status(f"天井推定失敗: {exc}")
+            return
+
+        if len(inliers) == 0:
+            self._set_status("天井推定失敗: インライヤなし")
+            return
+
+        normal = np.asarray(plane_model[:3], dtype=float)
+        norm = float(np.linalg.norm(normal))
+        if not np.isfinite(norm) or norm < 1e-12:
+            self._set_status("天井推定失敗: 法線が不正")
+            return
+        normal = normal / norm
+        if normal[2] > 0:
+            normal = -normal
+
+        nz = float(np.clip(abs(normal[2]), -1.0, 1.0))
+        tilt_deg = float(np.degrees(np.arccos(nz)))
+        if tilt_deg > float(self.ceiling_max_tilt.double_value):
+            self._set_status(f"天井推定失敗: 傾斜が大きい ({tilt_deg:.1f}°)")
+            return
+
+        inlier_global = idx[np.asarray(inliers, dtype=int)]
+        inlier_points = self.all_points[inlier_global]
+        point = inlier_points.mean(axis=0)
+        plane = PlaneParam(
+            normal=normal,
+            point=point,
+            inlier_count=len(inliers),
+            inlier_indices=inlier_global,
+            height=float(point[2]),
+        )
+        self.ceiling_plane = plane
+
+        if self._ceiling_name is not None:
+            self._remove_object(self._ceiling_name)
+        try:
+            mesh, _ = create_plane_patch_mesh(
+                plane,
+                self.all_points,
+                np.array([0.2, 0.4, 0.9]),
+                padding=0.05,
+                patch_shape=_patch_shape_value(self.patch_shape.selected_text),
+            )
+            self._ceiling_name = self._register_object(
+                label="天井",
+                geometry=mesh,
+                kind="mesh",
+                category="ceiling",
+            )
+        except Exception:
+            self._ceiling_name = None
+
+        self._set_status(f"天井推定OK: 傾斜={tilt_deg:.1f}°, inliers={len(inliers)}")
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
         if not self.keep_results_checkbox.checked:
@@ -1373,8 +1737,13 @@ class PrimitiveFittingApp:
                 )
             except Exception:
                 continue
-            name = f"stair_plane_{i}"
-            self.scene_widget.scene.add_geometry(name, mesh, self._mesh_material)
+            label = f"階段平面 {len(self._result_names) + 1}"
+            name = self._register_object(
+                label=label,
+                geometry=mesh,
+                kind="mesh",
+                category="result",
+            )
             self._result_names.append(name)
             self._result_meshes.append(mesh)
 
