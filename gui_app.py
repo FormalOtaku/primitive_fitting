@@ -577,7 +577,7 @@ class PrimitiveFittingApp:
         stairs_output_path: str = "stairs_results.json",
     ):
         self._app = gui.Application.instance
-        self.window = self._app.create_window("プリミティブフィッティング GUI", 1400, 900)
+        self.window = self._app.create_window("Primitive Fitting GUI", 1400, 900)
         self.window.set_on_layout(self._on_layout)
 
         self.scene_widget = gui.SceneWidget()

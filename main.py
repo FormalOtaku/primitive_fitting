@@ -1282,7 +1282,7 @@ def parse_args():
     parser.add_argument(
         "--gui-font",
         type=str,
-        default=None,
+        default="NotoSansCJK",
         help="Font family name or font file path for GUI (e.g., NotoSansCJK or /path/to/font.ttc)"
     )
     parser.add_argument(
