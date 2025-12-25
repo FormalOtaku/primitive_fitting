@@ -18,7 +18,6 @@ from primitives import (
     adaptive_seed_indices,
     expand_plane_from_seed,
     probe_cylinder_from_seed,
-    extract_multi_planes,
     extract_stair_planes,
     create_cylinder_mesh,
 )
@@ -731,27 +730,6 @@ class PrimitiveFittingApp:
         outliner_row.add_child(self.outliner_wire_button)
         outliner_group.add_child(outliner_row)
 
-        auto_group = gui.CollapsableVert("自動抽出", 0, gui.Margins(6, 6, 6, 6))
-        self.panel.add_child(auto_group)
-        auto_group.set_is_open(False)
-
-        self.auto_plane_button = gui.Button("全域平面抽出")
-        self.auto_plane_button.set_on_clicked(self._on_auto_plane_extract)
-        auto_group.add_child(self.auto_plane_button)
-
-        self.auto_plane_max = gui.NumberEdit(gui.NumberEdit.INT)
-        self.auto_plane_max.int_value = 10
-        self.auto_plane_min_inliers = gui.NumberEdit(gui.NumberEdit.INT)
-        self.auto_plane_min_inliers.int_value = 150
-        self.auto_plane_ransac_n = gui.NumberEdit(gui.NumberEdit.INT)
-        self.auto_plane_ransac_n.int_value = 3
-        self.auto_plane_iters = gui.NumberEdit(gui.NumberEdit.INT)
-        self.auto_plane_iters.int_value = 1000
-        auto_group.add_child(self._labeled_row("最大平面数", self.auto_plane_max))
-        auto_group.add_child(self._labeled_row("最小インライヤ数", self.auto_plane_min_inliers))
-        auto_group.add_child(self._labeled_row("RANSAC n", self.auto_plane_ransac_n))
-        auto_group.add_child(self._labeled_row("反復回数", self.auto_plane_iters))
-
         roi_group = gui.CollapsableVert("ROI / シード", 0, gui.Margins(6, 6, 6, 6))
         self.panel.add_child(roi_group)
         roi_group.set_is_open(False)
@@ -1191,6 +1169,22 @@ class PrimitiveFittingApp:
         self._objects = {}
         self._object_counter = 0
 
+    def _outliner_label(self, name: str) -> str:
+        obj = self._objects.get(name, {})
+        label = str(obj.get("label", name))
+        if not obj.get("visible", True):
+            prefix = "[H]"
+        else:
+            mode = obj.get("mode", "solid")
+            prefix = "[W]" if mode == "wire" else "[S]"
+        return f"{prefix} {label}"
+
+    def _refresh_outliner(self):
+        items = [self._outliner_label(n) for n in self._outliner_names]
+        self.outliner.set_items(items)
+        if 0 <= self._selected_outliner_index < len(items):
+            self.outliner.selected_index = self._selected_outliner_index
+
     def _register_object(
         self,
         *,
@@ -1229,7 +1223,7 @@ class PrimitiveFittingApp:
 
         self._objects[base_name] = obj
         self._outliner_names.append(base_name)
-        self.outliner.set_items([self._objects[n]["label"] for n in self._outliner_names])
+        self._refresh_outliner()
         return base_name
 
     def _remove_object(self, name: str):
@@ -1245,7 +1239,7 @@ class PrimitiveFittingApp:
         self._objects.pop(name, None)
         if name in self._outliner_names:
             self._outliner_names.remove(name)
-            self.outliner.set_items([self._objects[n]["label"] for n in self._outliner_names])
+            self._refresh_outliner()
 
     def _sync_object_visibility(self, name: str):
         obj = self._objects.get(name)
@@ -1277,6 +1271,7 @@ class PrimitiveFittingApp:
             return
         obj["visible"] = not bool(obj.get("visible", True))
         self._sync_object_visibility(name)
+        self._refresh_outliner()
 
     def _on_set_display_mode(self, mode: str):
         idx = int(self.outliner.selected_index)
@@ -1293,60 +1288,13 @@ class PrimitiveFittingApp:
         obj["mode"] = mode
         obj["visible"] = True if mode != "hidden" else False
         self._sync_object_visibility(name)
+        self._refresh_outliner()
 
     def _on_outliner_select(self, _value, _is_dbl_click=False):
         try:
             self._selected_outliner_index = int(self.outliner.selected_index)
         except Exception:
             self._selected_outliner_index = -1
-
-    def _on_auto_plane_extract(self):
-        if self.pcd is None or self.all_points is None:
-            self._set_status("点群が読み込まれていません。")
-            return
-        if not self.keep_results_checkbox.checked:
-            self._clear_results()
-
-        result = extract_multi_planes(
-            self.all_points,
-            distance_threshold=float(self.plane_threshold.double_value),
-            ransac_n=int(self.auto_plane_ransac_n.int_value),
-            num_iterations=int(self.auto_plane_iters.int_value),
-            min_inliers=int(self.auto_plane_min_inliers.int_value),
-            max_planes=int(self.auto_plane_max.int_value),
-            verbose=False,
-        )
-        planes = result.planes
-        if len(planes) == 0:
-            self._set_status("自動平面抽出: 平面が見つかりませんでした。")
-            return
-
-        colors = generate_plane_colors(len(planes))
-        for i, (plane, color) in enumerate(zip(planes, colors), start=1):
-            try:
-                mesh, _ = create_plane_patch_mesh(
-                    plane,
-                    self.all_points,
-                    color,
-                    padding=0.02,
-                    patch_shape=_patch_shape_value(self.patch_shape.selected_text),
-                )
-            except Exception:
-                continue
-            label = f"自動平面 {i:02d}"
-            name = self._register_object(
-                label=label,
-                geometry=mesh,
-                kind="mesh",
-                category="result",
-            )
-            self._result_names.append(name)
-            self._result_meshes.append(mesh)
-            self.results = append_plane_result(self.results, plane)
-
-        if self.auto_save_checkbox.checked:
-            save_results(self.results, self.output_path_edit.text_value)
-        self._set_status(f"自動平面抽出: {len(planes)}枚")
 
     def _on_save_profile(self):
         path = self.cylinder_profile_path.text_value.strip()
