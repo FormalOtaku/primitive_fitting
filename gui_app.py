@@ -731,6 +731,17 @@ class PrimitiveFittingApp:
         fit_group.add_child(self._labeled_row("円柱しきい値", self.cylinder_threshold))
         fit_group.add_child(self._labeled_row("法線閾値(度)", self.normal_th))
 
+        self.auto_tune_cylinder = gui.Checkbox("円柱パラメータ自動調整")
+        self.auto_tune_cylinder.checked = False
+        fit_group.add_child(self.auto_tune_cylinder)
+
+        self.target_diameter = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.target_diameter.double_value = 0.0
+        self.target_height = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self.target_height.double_value = 0.0
+        fit_group.add_child(self._labeled_row("想定直径(m)", self.target_diameter))
+        fit_group.add_child(self._labeled_row("想定高さ(m)", self.target_height))
+
         self.expand_method = gui.Combobox()
         self.expand_method.add_item(EXPAND_METHOD_LABELS["component"])
         self.expand_method.add_item(EXPAND_METHOD_LABELS["bfs"])
@@ -1114,6 +1125,7 @@ class PrimitiveFittingApp:
     def _run_cylinder(self, seed_center: np.ndarray, seed_radius: float):
         if not self.keep_results_checkbox.checked:
             self._clear_results()
+        self._maybe_autotune_cylinder()
         result = probe_cylinder_from_seed(
             self.all_points,
             seed_center,
@@ -1159,6 +1171,42 @@ class PrimitiveFittingApp:
         self._set_status(
             f"円柱OK: 半径={result.final.radius:.4f} m, 長さ={result.final.length:.3f} m"
         )
+
+    def _maybe_autotune_cylinder(self) -> None:
+        if not self.auto_tune_cylinder.checked:
+            return
+        diameter = float(self.target_diameter.double_value)
+        height = float(self.target_height.double_value)
+        if diameter <= 0.0 and height <= 0.0:
+            return
+
+        def _clamp(val: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, val))
+
+        if diameter > 0.0:
+            radius = diameter * 0.5
+            r_min = _clamp(0.4 * radius, 0.05, 0.25)
+            r_step = _clamp(0.2 * radius, 0.02, 0.10)
+            r_max = _clamp(1.6 * radius, max(r_min + 0.05, 0.2), 1.2)
+            self.roi_r_min.double_value = r_min
+            self.roi_r_step.double_value = r_step
+            self.roi_r_max.double_value = r_max
+
+            threshold = _clamp(0.02 * diameter + 0.005, 0.01, 0.05)
+            self.cylinder_threshold.double_value = threshold
+
+            grow_radius = _clamp(0.7 * radius, 0.05, 0.25)
+            self.grow_radius.double_value = grow_radius
+
+            min_points = int(_clamp(200.0 * (radius / 0.2), 60.0, 300.0))
+            self.roi_min_points.int_value = max(10, min_points)
+
+            if height > 0.0:
+                max_expand = float(np.sqrt((height * 0.5) ** 2 + radius ** 2) * 1.1)
+                self.max_expand_radius.double_value = max(0.5, max_expand)
+        elif height > 0.0:
+            max_expand = float(height * 0.6)
+            self.max_expand_radius.double_value = max(0.5, max_expand)
 
     def _run_stairs(self, seed_center: np.ndarray, seed_indices: np.ndarray):
         if not self.keep_results_checkbox.checked:
