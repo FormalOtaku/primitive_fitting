@@ -8,3 +8,6 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore:\\[Errno 13\\] Permission denied\\.  joblib will operate in serial mode:UserWarning",
+]
