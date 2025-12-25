@@ -1274,6 +1274,12 @@ def parse_args():
         help="Path to input PCD or PLY file (optional: opens file dialog if not specified)"
     )
     parser.add_argument(
+        "--gui-app",
+        action="store_true",
+        dest="gui_app",
+        help="Launch Open3D GUI app with side panel controls"
+    )
+    parser.add_argument(
         "--output", "-o",
         type=str,
         default="fit_results.json",
@@ -3929,6 +3935,10 @@ def run_stairs_mode(
 def main():
     """Main entry point."""
     args = parse_args()
+    if args.gui_app:
+        from gui_app import launch_gui
+        launch_gui(args)
+        return
     try:
         initial_cylinder = resolve_initial_cylinder(args)
     except ValueError as exc:
