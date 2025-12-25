@@ -586,6 +586,13 @@ class PrimitiveFittingApp:
         self.scene_widget.set_on_mouse(self._on_mouse)
         self.window.add_child(self.scene_widget)
 
+        self.axes_widget = gui.SceneWidget()
+        self.axes_widget.scene = rendering.Open3DScene(self.window.renderer)
+        self.axes_widget.scene.set_background([0.1, 0.1, 0.1, 1.0])
+        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        self.axes_widget.scene.add_geometry("axes", axes, self._mesh_material)
+        self.window.add_child(self.axes_widget)
+
         self.panel = gui.ScrollableVert(0, gui.Margins(8, 8, 8, 8))
         self.window.add_child(self.panel)
 
@@ -605,6 +612,7 @@ class PrimitiveFittingApp:
         self._result_meshes: List[o3d.geometry.TriangleMesh] = []
         self._seed_name: Optional[str] = None
         self._pointcloud_name: Optional[str] = None
+        self._grid_name: Optional[str] = None
 
         self._objects: Dict[str, Dict[str, object]] = {}
         self._outliner_names: List[str] = []
@@ -624,6 +632,10 @@ class PrimitiveFittingApp:
         self._all_normals_original: Optional[np.ndarray] = None
         self._edit_mask: Optional[np.ndarray] = None
         self._edit_history: List[np.ndarray] = []
+        self._current_indices: Optional[np.ndarray] = None
+        self._drag_start: Optional[Tuple[int, int]] = None
+        self._drag_end: Optional[Tuple[int, int]] = None
+        self._dragging: bool = False
 
         self.last_pick: Optional[np.ndarray] = None
 
@@ -1012,6 +1024,8 @@ class PrimitiveFittingApp:
         panel_width = int(360 * self.window.scaling)
         self.scene_widget.frame = gui.Rect(r.x, r.y, r.width - panel_width, r.height)
         self.panel.frame = gui.Rect(r.get_right() - panel_width, r.y, panel_width, r.height)
+        axes_size = int(120 * self.window.scaling)
+        self.axes_widget.frame = gui.Rect(r.x + 8, r.y + 8, axes_size, axes_size)
 
     def _on_open_dialog(self):
         dlg = gui.FileDialog(gui.FileDialog.OPEN, "点群ファイルを選択", self.window.theme)
@@ -1075,9 +1089,43 @@ class PrimitiveFittingApp:
         self._set_status("結果をクリアしました。")
 
     def _on_mouse(self, event):
-        if event.type == gui.MouseEvent.Type.BUTTON_DOWN and event.is_modifier_down(
-            gui.KeyModifier.SHIFT
-        ):
+        if event.is_modifier_down(gui.KeyModifier.SHIFT):
+            if self.edit_mode.checked:
+                if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
+                    self._drag_start = (int(event.x), int(event.y))
+                    self._drag_end = None
+                    self._dragging = True
+                    return gui.Widget.EventCallbackResult.HANDLED
+                if event.type == gui.MouseEvent.Type.DRAG and self._dragging:
+                    self._drag_end = (int(event.x), int(event.y))
+                    return gui.Widget.EventCallbackResult.HANDLED
+                if event.type == gui.MouseEvent.Type.BUTTON_UP and self._dragging:
+                    self._dragging = False
+                    start = self._drag_start
+                    end = self._drag_end or (int(event.x), int(event.y))
+                    if start is None:
+                        return gui.Widget.EventCallbackResult.HANDLED
+                    dx = abs(end[0] - start[0])
+                    dy = abs(end[1] - start[1])
+                    if max(dx, dy) < 4:
+                        self._handle_shift_click(event)
+                    else:
+                        self._erase_points_in_rect(start, end)
+                    return gui.Widget.EventCallbackResult.HANDLED
+            if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
+                self._handle_shift_click(event)
+                return gui.Widget.EventCallbackResult.HANDLED
+        if event.type in (gui.MouseEvent.Type.DRAG, gui.MouseEvent.Type.BUTTON_UP, gui.MouseEvent.Type.WHEEL):
+            self._sync_axes_camera()
+        return gui.Widget.EventCallbackResult.IGNORED
+
+    def _handle_shift_click(self, event):
+        if event.type != gui.MouseEvent.Type.BUTTON_DOWN:
+            return
+        if not (self.scene_widget.frame.x <= event.x <= self.scene_widget.frame.get_right() and
+                self.scene_widget.frame.y <= event.y <= self.scene_widget.frame.get_bottom()):
+            return
+        if self.edit_mode.checked:
             def depth_callback(depth_image):
                 x = int(event.x - self.scene_widget.frame.x)
                 y = int(event.y - self.scene_widget.frame.y)
@@ -1099,18 +1147,41 @@ class PrimitiveFittingApp:
                     if snapped is None:
                         self._set_status("クリック位置の近くに点がありません。ズームして再クリックしてください。")
                         return
-                    if self.edit_mode.checked:
-                        self._erase_points_at(snapped)
-                    else:
-                        self._set_seed(snapped)
-                        if self.auto_run_checkbox.checked:
-                            self._run_fit()
+                    self._erase_points_at(snapped)
 
                 gui.Application.instance.post_to_main_thread(self.window, update)
 
             self.scene_widget.scene.scene.render_to_depth_image(depth_callback)
-            return gui.Widget.EventCallbackResult.HANDLED
-        return gui.Widget.EventCallbackResult.IGNORED
+            return
+
+        def depth_callback(depth_image):
+            x = int(event.x - self.scene_widget.frame.x)
+            y = int(event.y - self.scene_widget.frame.y)
+            if x < 0 or y < 0 or x >= self.scene_widget.frame.width or y >= self.scene_widget.frame.height:
+                return
+            depth = np.asarray(depth_image)[y, x]
+            if depth == 1.0:
+                return
+            world = self.scene_widget.scene.camera.unproject(
+                x,
+                y,
+                depth,
+                self.scene_widget.frame.width,
+                self.scene_widget.frame.height,
+            )
+
+            def update():
+                snapped = self._snap_to_point(np.array(world, dtype=float))
+                if snapped is None:
+                    self._set_status("クリック位置の近くに点がありません。ズームして再クリックしてください。")
+                    return
+                self._set_seed(snapped)
+                if self.auto_run_checkbox.checked:
+                    self._run_fit()
+
+            gui.Application.instance.post_to_main_thread(self.window, update)
+
+        self.scene_widget.scene.scene.render_to_depth_image(depth_callback)
 
     def _set_status(self, text: str):
         self.status.text = text
@@ -1176,11 +1247,13 @@ class PrimitiveFittingApp:
         if self._all_points_original is None:
             return
         mask = self._edit_mask if self._edit_mask is not None else np.ones(len(self._all_points_original), dtype=bool)
-        pts = self._all_points_original[mask]
+        indices = np.flatnonzero(mask)
+        self._current_indices = indices
+        pts = self._all_points_original[indices]
         self.pcd = o3d.geometry.PointCloud()
         self.pcd.points = o3d.utility.Vector3dVector(pts)
         if self._all_normals_original is not None and len(self._all_normals_original) == len(self._all_points_original):
-            norms = self._all_normals_original[mask]
+            norms = self._all_normals_original[indices]
             self.pcd.normals = o3d.utility.Vector3dVector(norms)
         self.all_points = np.asarray(self.pcd.points)
         self.all_normals = np.asarray(self.pcd.normals) if self.pcd.has_normals() else None
@@ -1204,6 +1277,8 @@ class PrimitiveFittingApp:
             center = bounds.get_center()
             self.scene_widget.setup_camera(60, bounds, center)
             self.scene_widget.look_at(center, center - [0, 0, 3], [0, -1, 0])
+            self._sync_axes_camera()
+        self._ensure_grid()
 
     def _erase_points_at(self, center: np.ndarray):
         if self._all_points_original is None or self._edit_mask is None:
@@ -1221,6 +1296,139 @@ class PrimitiveFittingApp:
         self._edit_history.append(to_remove)
         self._update_point_cloud_view()
         self._set_status(f"{len(to_remove)}点を削除しました（元データは保持）")
+
+    def _erase_points_in_rect(self, start: Tuple[int, int], end: Tuple[int, int]):
+        if self._all_points_original is None or self._edit_mask is None or self.all_points is None:
+            return
+        if self._current_indices is None:
+            return
+        x0, y0 = start
+        x1, y1 = end
+        x_min, x_max = sorted([x0, x1])
+        y_min, y_max = sorted([y0, y1])
+
+        # Convert to widget-local coords
+        x_min -= int(self.scene_widget.frame.x)
+        x_max -= int(self.scene_widget.frame.x)
+        y_min -= int(self.scene_widget.frame.y)
+        y_max -= int(self.scene_widget.frame.y)
+        if x_max < 0 or y_max < 0 or x_min >= self.scene_widget.frame.width or y_min >= self.scene_widget.frame.height:
+            self._set_status("選択範囲がビュー外です。")
+            return
+
+        x_min = max(0, min(self.scene_widget.frame.width - 1, x_min))
+        x_max = max(0, min(self.scene_widget.frame.width - 1, x_max))
+        y_min = max(0, min(self.scene_widget.frame.height - 1, y_min))
+        y_max = max(0, min(self.scene_widget.frame.height - 1, y_max))
+        if x_max <= x_min or y_max <= y_min:
+            return
+
+        coords, valid = self._project_points_to_screen(self.all_points)
+        if coords is None:
+            return
+        xs = coords[:, 0]
+        ys = coords[:, 1]
+        in_rect = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+        idx_local = np.where(valid & in_rect)[0]
+        if len(idx_local) == 0:
+            self._set_status("選択範囲に点がありません。")
+            return
+        idx_global = self._current_indices[idx_local]
+        self._edit_mask[idx_global] = False
+        self._edit_history.append(idx_global)
+        self._update_point_cloud_view()
+        self._set_status(f"{len(idx_global)}点を削除しました（元データは保持）")
+
+    def _project_points_to_screen(self, points: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if points is None or len(points) == 0:
+            return None, None
+        width = int(self.scene_widget.frame.width)
+        height = int(self.scene_widget.frame.height)
+        if width <= 1 or height <= 1:
+            return None, None
+        view = np.asarray(self.scene_widget.scene.camera.get_view_matrix(), dtype=float)
+        proj = np.asarray(self.scene_widget.scene.camera.get_projection_matrix(width, height), dtype=float)
+        pts = np.asarray(points, dtype=float)
+        ones = np.ones((len(pts), 1), dtype=float)
+        pts_h = np.hstack([pts, ones])
+        clip = (pts_h @ view.T) @ proj.T
+        w = clip[:, 3]
+        valid = w > 1e-8
+        ndc = np.zeros((len(pts), 3), dtype=float)
+        ndc[valid] = clip[valid, :3] / w[valid, None]
+        z_ok = (ndc[:, 2] >= -1.0) & (ndc[:, 2] <= 1.0)
+        valid &= z_ok
+        xs = (ndc[:, 0] + 1.0) * 0.5 * width
+        ys = (1.0 - ndc[:, 1]) * 0.5 * height
+        coords = np.column_stack([xs, ys])
+        return coords, valid
+
+    def _ensure_grid(self):
+        if self.pcd is None or self.all_points is None or len(self.all_points) == 0:
+            return
+        if self._grid_name is not None:
+            return
+        bounds = self.scene_widget.scene.bounding_box
+        min_bound = np.asarray(bounds.min_bound)
+        max_bound = np.asarray(bounds.max_bound)
+        extent = max(max_bound[0] - min_bound[0], max_bound[1] - min_bound[1])
+        spacing = 1.0
+        if extent < 5.0:
+            spacing = 0.5
+        if extent < 2.0:
+            spacing = 0.2
+        z = float(min_bound[2])
+        lines = self._create_grid_lines(min_bound[0], max_bound[0], min_bound[1], max_bound[1], z, spacing)
+        self._grid_name = self._register_object(
+            label="グリッド",
+            geometry=lines,
+            kind="line",
+            category="base",
+            color=np.array([0.3, 0.3, 0.3]),
+        )
+
+    def _create_grid_lines(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        z: float,
+        spacing: float,
+    ) -> o3d.geometry.LineSet:
+        x0 = np.floor(x_min / spacing) * spacing
+        x1 = np.ceil(x_max / spacing) * spacing
+        y0 = np.floor(y_min / spacing) * spacing
+        y1 = np.ceil(y_max / spacing) * spacing
+        xs = np.arange(x0, x1 + spacing * 0.5, spacing)
+        ys = np.arange(y0, y1 + spacing * 0.5, spacing)
+        points = []
+        lines = []
+        idx = 0
+        for x in xs:
+            points.append([x, y0, z])
+            points.append([x, y1, z])
+            lines.append([idx, idx + 1])
+            idx += 2
+        for y in ys:
+            points.append([x0, y, z])
+            points.append([x1, y, z])
+            lines.append([idx, idx + 1])
+            idx += 2
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=float))
+        ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=int))
+        return ls
+
+    def _sync_axes_camera(self):
+        view = np.asarray(self.scene_widget.scene.camera.get_view_matrix(), dtype=float)
+        if view.shape != (4, 4):
+            return
+        R = view[:3, :3]
+        forward = -R[2]
+        up = R[1]
+        eye = forward * 2.0
+        self.axes_widget.scene.camera.look_at(np.array([0.0, 0.0, 0.0]), eye, up)
 
     def _on_edit_undo(self):
         if not self._edit_history or self._edit_mask is None:
@@ -1316,6 +1524,15 @@ class PrimitiveFittingApp:
 
         if kind == "pcd":
             self.scene_widget.scene.add_geometry(solid_name, geometry, self._pcd_material)
+        elif kind == "line":
+            if color is not None:
+                try:
+                    geometry.colors = o3d.utility.Vector3dVector(
+                        np.tile(color, (len(geometry.lines), 1))
+                    )
+                except Exception:
+                    pass
+            self.scene_widget.scene.add_geometry(solid_name, geometry, self._line_material)
         else:
             if color is not None:
                 try:
@@ -1369,7 +1586,11 @@ class PrimitiveFittingApp:
         if mode == "wire" and kind == "mesh" and obj.get("wire") is not None:
             self.scene_widget.scene.add_geometry(wire_name, obj["wire"], self._line_material)
         else:
-            self.scene_widget.scene.add_geometry(solid_name, obj["solid"], self._mesh_material if kind == "mesh" else self._pcd_material)
+            if kind == "line":
+                mat = self._line_material
+            else:
+                mat = self._mesh_material if kind == "mesh" else self._pcd_material
+            self.scene_widget.scene.add_geometry(solid_name, obj["solid"], mat)
 
     def _on_toggle_visibility(self):
         idx = int(self.outliner.selected_index)
@@ -1423,6 +1644,13 @@ class PrimitiveFittingApp:
             try:
                 wire.colors = o3d.utility.Vector3dVector(
                     np.tile(rgb, (len(wire.lines), 1))
+                )
+            except Exception:
+                pass
+        elif obj.get("kind") == "line":
+            try:
+                mesh.colors = o3d.utility.Vector3dVector(
+                    np.tile(rgb, (len(mesh.lines), 1))
                 )
             except Exception:
                 pass
