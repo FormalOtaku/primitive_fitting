@@ -187,7 +187,16 @@ primitive_fitting/
 ├── primitives.py    # プリミティブフィット関数
 ├── requirements.txt # 依存パッケージ
 ├── README.md        # このファイル
-└── SPEC.md          # 仕様書
+└── docs/            # 仕様・設計・研究用ドキュメント
+    ├── SPEC.md
+    ├── SPEC_OVERVIEW_JP.md
+    ├── IMPLEMENTATION_LOGIC_JP.md
+    ├── IMPLEMENTATION_LOGIC_PSEUDOCODE_JP.md
+    ├── IMPLEMENTATION_LOGIC_FORMULA_JP.md
+    ├── RESEARCH_PLAN_JP.md
+    ├── GIT_WORKFLOW_JP.md
+    ├── RUNBOOK_GUIDE_JP.md
+    └── RUNBOOK_TEMPLATE_JP.md
 ```
 
 ## Stairs Mode (階段モード)

@@ -31,6 +31,42 @@ class CylinderParam:
     inlier_indices: Optional[np.ndarray] = None
 
 
+_GPU_ENABLED = False
+_GPU_DEVICE = o3d.core.Device("CPU:0")
+
+
+def set_gpu_enabled(enabled: bool) -> bool:
+    """Enable or disable GPU acceleration for vectorized math (CUDA only)."""
+    global _GPU_ENABLED, _GPU_DEVICE
+    if enabled:
+        try:
+            if o3d.core.cuda.is_available() and o3d.core.cuda.device_count() > 0:
+                _GPU_DEVICE = o3d.core.Device("CUDA:0")
+                _GPU_ENABLED = True
+                return True
+        except Exception:
+            pass
+    _GPU_DEVICE = o3d.core.Device("CPU:0")
+    _GPU_ENABLED = False
+    return False
+
+
+def _gpu_enabled() -> bool:
+    return _GPU_ENABLED
+
+
+def _gpu_device() -> o3d.core.Device:
+    return _GPU_DEVICE
+
+
+def _tensor_from_numpy(arr: np.ndarray, *, device: Optional[o3d.core.Device] = None) -> o3d.core.Tensor:
+    dev = device if device is not None else _GPU_DEVICE
+    return o3d.core.Tensor(
+        np.asarray(arr, dtype=np.float32),
+        dtype=o3d.core.Dtype.Float32,
+        device=dev,
+    )
+
 def _orient_direction(vec: np.ndarray, *, prefer_positive_z: bool) -> np.ndarray:
     """Return vec or -vec with a deterministic sign convention."""
     vec = np.asarray(vec, dtype=float)
@@ -86,17 +122,35 @@ def fit_plane(
     if points is None or len(points) < 3:
         return None
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    plane_model = None
+    inliers = None
+    if _gpu_enabled():
+        try:
+            pts_t = _tensor_from_numpy(points, device=_gpu_device())
+            pcd_t = o3d.t.geometry.PointCloud(device=_gpu_device())
+            pcd_t.point["positions"] = pts_t
+            plane_model, inliers = pcd_t.segment_plane(
+                distance_threshold=float(distance_threshold),
+                ransac_n=int(ransac_n),
+                num_iterations=int(num_iterations),
+            )
+            plane_model = plane_model.cpu().numpy()
+            inliers = inliers.cpu().numpy().astype(int)
+        except Exception:
+            plane_model = None
+            inliers = None
 
-    try:
-        plane_model, inliers = pcd.segment_plane(
-            distance_threshold=distance_threshold,
-            ransac_n=ransac_n,
-            num_iterations=num_iterations
-        )
-    except RuntimeError:
-        return None
+    if plane_model is None or inliers is None:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        try:
+            plane_model, inliers = pcd.segment_plane(
+                distance_threshold=distance_threshold,
+                ransac_n=ransac_n,
+                num_iterations=num_iterations
+            )
+        except RuntimeError:
+            return None
 
     if len(inliers) == 0:
         return None
@@ -758,6 +812,8 @@ def expand_plane_from_seed(
     points = np.asarray(points, dtype=float)
     seed_center = np.asarray(seed_center, dtype=float).flatten()
     time_start = perf_counter()
+    use_gpu = _gpu_enabled()
+    pts_t = None
 
     if points.ndim != 2 or points.shape[1] != 3:
         return SeedExpandPlaneResult(
@@ -786,8 +842,24 @@ def expand_plane_from_seed(
     normal_cos_threshold = np.cos(np.deg2rad(normal_threshold_deg))
 
     # Step 1: Extract seed points (squared distances for speed)
-    delta = points - seed_center
-    distances2_to_seed = np.einsum("ij,ij->i", delta, delta)
+    distances2_to_seed = None
+    distances2_to_seed_t = None
+    if use_gpu and points.size > 0:
+        try:
+            pts_t = _tensor_from_numpy(points, device=_gpu_device())
+            seed_center_t = _tensor_from_numpy(seed_center, device=_gpu_device())
+            diff_t = pts_t - seed_center_t
+            distances2_to_seed_t = (diff_t * diff_t).sum(axis=1)
+            distances2_to_seed = distances2_to_seed_t.cpu().numpy()
+        except Exception:
+            distances2_to_seed = None
+            distances2_to_seed_t = None
+            pts_t = None
+            use_gpu = False
+
+    if distances2_to_seed is None:
+        delta = points - seed_center
+        distances2_to_seed = np.einsum("ij,ij->i", delta, delta)
     seed_radius2 = float(seed_radius) * float(seed_radius)
     seed_mask = distances2_to_seed <= seed_radius2
     seed_indices = np.where(seed_mask)[0]
@@ -844,17 +916,40 @@ def expand_plane_from_seed(
         print(f"  Expansion region: {len(expand_points)} points within {max_expand_radius}m")
 
     # Compute plane distance for all expansion candidates
-    plane_distances = np.abs(np.dot(expand_points - plane_point, plane_normal))
-    candidate_mask = plane_distances < distance_threshold
+    candidate_mask = None
+    if use_gpu and pts_t is not None and distances2_to_seed_t is not None:
+        try:
+            plane_point_t = _tensor_from_numpy(plane_point, device=_gpu_device())
+            plane_normal_t = _tensor_from_numpy(plane_normal, device=_gpu_device())
+            plane_norm_t = (plane_normal_t * plane_normal_t).sum().sqrt()
+            plane_normal_t = plane_normal_t / plane_norm_t
+            plane_distances_all = ((pts_t - plane_point_t) * plane_normal_t).sum(axis=1).abs()
+            candidate_mask = plane_distances_all < float(distance_threshold)
+            if has_normals:
+                normals_t = _tensor_from_numpy(normals, device=_gpu_device())
+                normal_alignment = (normals_t * plane_normal_t).sum(axis=1).abs()
+                candidate_mask = candidate_mask & (normal_alignment > float(normal_cos_threshold))
+            candidate_mask = candidate_mask & (distances2_to_seed_t <= float(max_expand_radius2))
+            candidate_mask = candidate_mask.cpu().numpy()
+        except Exception:
+            candidate_mask = None
+            use_gpu = False
 
-    # Optional: apply normal condition
-    if has_normals:
-        expand_normals = normals[expand_indices]
-        normal_alignment = np.abs(np.dot(expand_normals, plane_normal))
-        candidate_mask &= normal_alignment > normal_cos_threshold
+    if candidate_mask is None:
+        plane_distances = np.abs(np.dot(expand_points - plane_point, plane_normal))
+        candidate_mask = plane_distances < distance_threshold
 
-    candidate_local_indices = np.where(candidate_mask)[0]
-    candidate_global_indices = expand_indices[candidate_local_indices]
+        # Optional: apply normal condition
+        if has_normals:
+            expand_normals = normals[expand_indices]
+            normal_alignment = np.abs(np.dot(expand_normals, plane_normal))
+            candidate_mask &= normal_alignment > normal_cos_threshold
+
+        candidate_local_indices = np.where(candidate_mask)[0]
+        candidate_global_indices = expand_indices[candidate_local_indices]
+    else:
+        candidate_global_indices = np.where(candidate_mask)[0]
+        candidate_local_indices = np.where(candidate_mask[expand_indices])[0]
     time_candidates = perf_counter()
 
     if verbose:
@@ -1948,15 +2043,27 @@ def snap_axis_to_vertical(
     Returns:
         Possibly snapped axis direction (normalized)
     """
-    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
-    axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+    vertical = np.array([0.0, 0.0, 1.0], dtype=float)
+    return snap_axis_to_reference(axis_dir, vertical, snap_threshold_deg=float(snap_threshold_deg))
 
-    vertical = np.array([0.0, 0.0, 1.0])
-    cos_angle = abs(float(np.dot(axis_dir, vertical)))
+
+def snap_axis_to_reference(
+    axis_dir: np.ndarray,
+    ref_dir: np.ndarray,
+    *,
+    snap_threshold_deg: float = 5.0,
+) -> np.ndarray:
+    """Snap axis direction to reference direction if within threshold."""
+    axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
+    ref_dir = np.asarray(ref_dir, dtype=float).reshape(-1)
+    axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+    ref_dir = ref_dir / np.maximum(np.linalg.norm(ref_dir), 1e-8)
+
+    cos_angle = abs(float(np.dot(axis_dir, ref_dir)))
     angle_deg = float(np.rad2deg(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
 
     if angle_deg <= float(snap_threshold_deg):
-        return vertical if axis_dir[2] >= 0 else -vertical
+        return ref_dir if np.dot(axis_dir, ref_dir) >= 0 else -ref_dir
 
     return axis_dir
 
@@ -2153,6 +2260,33 @@ def _estimate_cylinder_from_points(
     )
 
 
+def fit_cylinder_with_axis(
+    points: np.ndarray,
+    axis_direction: np.ndarray,
+    *,
+    circle_ransac_iters: int = 200,
+    circle_inlier_threshold: float = 0.01,
+    length_margin: float = 0.05,
+    length_quantile: float = 0.02,
+) -> Optional[CylinderParam]:
+    """Refit a cylinder with a fixed axis direction."""
+    axis_dir = np.asarray(axis_direction, dtype=float).reshape(-1)
+    if axis_dir.size != 3:
+        return None
+    axis_norm = np.linalg.norm(axis_dir)
+    if not np.isfinite(axis_norm) or axis_norm <= 1e-8:
+        return None
+    axis_dir = axis_dir / axis_norm
+    return _estimate_cylinder_from_points(
+        points,
+        axis_dir=axis_dir,
+        circle_ransac_iters=circle_ransac_iters,
+        circle_inlier_threshold=circle_inlier_threshold,
+        length_margin=length_margin,
+        length_quantile=length_quantile,
+    )
+
+
 def adaptive_seed_indices(
     points: np.ndarray,
     seed_center: np.ndarray,
@@ -2326,6 +2460,7 @@ def extract_cylinder_surface_component(
     axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
     axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
     seed_indices = np.asarray(seed_indices, dtype=int).reshape(-1)
+    use_gpu = _gpu_enabled()
     if axis_point.size != 3 or axis_dir.size != 3:
         return CylinderSurfaceExtractResult(
             inlier_indices=np.empty((0,), dtype=int),
@@ -2355,58 +2490,97 @@ def extract_cylinder_surface_component(
     axis_dir = axis_dir / axis_norm
 
     max_expand_radius = float(max_expand_radius)
-    if max_expand_radius > 0:
-        delta = pts - np.asarray(seed_center, dtype=float).reshape(-1)
-        dist2 = np.einsum("ij,ij->i", delta, delta)
-        expand_mask = dist2 <= max_expand_radius * max_expand_radius
-        expand_indices = np.where(expand_mask)[0]
-    else:
-        expand_indices = np.arange(len(pts), dtype=int)
+    candidate_indices = None
+    if use_gpu and pts.size > 0:
+        try:
+            pts_t = _tensor_from_numpy(pts, device=_gpu_device())
+            axis_point_t = _tensor_from_numpy(axis_point, device=_gpu_device())
+            axis_dir_t = _tensor_from_numpy(axis_dir, device=_gpu_device())
+            axis_norm_t = (axis_dir_t * axis_dir_t).sum().sqrt()
+            axis_dir_t = axis_dir_t / axis_norm_t
+            diff_t = pts_t - axis_point_t
+            t_t = (diff_t * axis_dir_t).sum(axis=1)
+            radial_vec_t = diff_t - t_t.reshape((-1, 1)) * axis_dir_t
+            radial_dist_t = (radial_vec_t * radial_vec_t).sum(axis=1).sqrt()
+            half_len = 0.5 * float(length)
+            cap_margin = float(cap_margin)
+            candidate_mask_t = (radial_dist_t - float(radius)).abs() < float(surface_threshold)
+            candidate_mask_t = candidate_mask_t & (t_t >= -half_len - cap_margin) & (t_t <= half_len + cap_margin)
+            if max_expand_radius > 0:
+                seed_center_t = _tensor_from_numpy(seed_center, device=_gpu_device())
+                dist2_t = ((pts_t - seed_center_t) * (pts_t - seed_center_t)).sum(axis=1)
+                candidate_mask_t = candidate_mask_t & (dist2_t <= max_expand_radius * max_expand_radius)
+            if normals is not None and np.asarray(normals).shape == pts.shape:
+                normals_t = _tensor_from_numpy(normals, device=_gpu_device())
+                normals_norm_t = (normals_t * normals_t).sum(axis=1).sqrt().reshape((-1, 1))
+                normals_t = normals_t / normals_norm_t
+                radial_dir_t = radial_vec_t / radial_dist_t.reshape((-1, 1))
+                normal_cos_threshold = np.cos(np.deg2rad(float(normal_angle_threshold_deg)))
+                alignment_t = (radial_dir_t * normals_t).sum(axis=1).abs()
+                aligned_mask_t = candidate_mask_t & (alignment_t > float(normal_cos_threshold))
+                base_count = int(candidate_mask_t.sum().cpu().numpy())
+                aligned_count = int(aligned_mask_t.sum().cpu().numpy())
+                min_keep = max(6, int(base_count * 0.25))
+                if aligned_count >= min_keep:
+                    candidate_mask_t = aligned_mask_t
+            candidate_indices = np.where(candidate_mask_t.cpu().numpy())[0]
+        except Exception:
+            candidate_indices = None
+            use_gpu = False
 
-    if expand_indices.size == 0:
-        return CylinderSurfaceExtractResult(
-            inlier_indices=np.empty((0,), dtype=int),
-            candidate_count=0,
-            seed_inlier_count=0,
-            stopped_early=False,
-            stop_reason="no_expand_points",
-            steps=0,
-            max_frontier_size=0,
-            success=False,
-            message="No points within max_expand_radius",
+    if candidate_indices is None:
+        if max_expand_radius > 0:
+            delta = pts - np.asarray(seed_center, dtype=float).reshape(-1)
+            dist2 = np.einsum("ij,ij->i", delta, delta)
+            expand_mask = dist2 <= max_expand_radius * max_expand_radius
+            expand_indices = np.where(expand_mask)[0]
+        else:
+            expand_indices = np.arange(len(pts), dtype=int)
+
+        if expand_indices.size == 0:
+            return CylinderSurfaceExtractResult(
+                inlier_indices=np.empty((0,), dtype=int),
+                candidate_count=0,
+                seed_inlier_count=0,
+                stopped_early=False,
+                stop_reason="no_expand_points",
+                steps=0,
+                max_frontier_size=0,
+                success=False,
+                message="No points within max_expand_radius",
+            )
+
+        expand_points = pts[expand_indices]
+        diff = expand_points - axis_point
+        t = diff @ axis_dir
+        radial_vec = diff - np.outer(t, axis_dir)
+        radial_dist = np.linalg.norm(radial_vec, axis=1)
+        half_len = 0.5 * float(length)
+        cap_margin = float(cap_margin)
+
+        candidate_mask = (
+            np.abs(radial_dist - float(radius)) < float(surface_threshold)
+        ) & (
+            t >= -half_len - cap_margin
+        ) & (
+            t <= half_len + cap_margin
         )
-
-    expand_points = pts[expand_indices]
-    diff = expand_points - axis_point
-    t = diff @ axis_dir
-    radial_vec = diff - np.outer(t, axis_dir)
-    radial_dist = np.linalg.norm(radial_vec, axis=1)
-    half_len = 0.5 * float(length)
-    cap_margin = float(cap_margin)
-
-    candidate_mask = (
-        np.abs(radial_dist - float(radius)) < float(surface_threshold)
-    ) & (
-        t >= -half_len - cap_margin
-    ) & (
-        t <= half_len + cap_margin
-    )
-    if normals is not None and np.asarray(normals).shape == pts.shape:
-        expand_normals = np.asarray(normals, dtype=float)[expand_indices]
-        expand_normals = expand_normals / np.maximum(
-            np.linalg.norm(expand_normals, axis=1, keepdims=True), 1e-8
-        )
-        radial_dir = radial_vec / np.maximum(radial_dist[:, None], 1e-8)
-        normal_cos_threshold = np.cos(np.deg2rad(float(normal_angle_threshold_deg)))
-        alignment = np.abs(np.einsum("ij,ij->i", radial_dir, expand_normals))
-        aligned_mask = candidate_mask & (alignment > normal_cos_threshold)
-        base_count = int(np.count_nonzero(candidate_mask))
-        aligned_count = int(np.count_nonzero(aligned_mask))
-        min_keep = max(6, int(base_count * 0.25))
-        if aligned_count >= min_keep:
-            candidate_mask = aligned_mask
-    candidate_local = np.where(candidate_mask)[0]
-    candidate_indices = expand_indices[candidate_local]
+        if normals is not None and np.asarray(normals).shape == pts.shape:
+            expand_normals = np.asarray(normals, dtype=float)[expand_indices]
+            expand_normals = expand_normals / np.maximum(
+                np.linalg.norm(expand_normals, axis=1, keepdims=True), 1e-8
+            )
+            radial_dir = radial_vec / np.maximum(radial_dist[:, None], 1e-8)
+            normal_cos_threshold = np.cos(np.deg2rad(float(normal_angle_threshold_deg)))
+            alignment = np.abs(np.einsum("ij,ij->i", radial_dir, expand_normals))
+            aligned_mask = candidate_mask & (alignment > normal_cos_threshold)
+            base_count = int(np.count_nonzero(candidate_mask))
+            aligned_count = int(np.count_nonzero(aligned_mask))
+            min_keep = max(6, int(base_count * 0.25))
+            if aligned_count >= min_keep:
+                candidate_mask = aligned_mask
+        candidate_local = np.where(candidate_mask)[0]
+        candidate_indices = expand_indices[candidate_local]
 
     if candidate_indices.size == 0:
         return CylinderSurfaceExtractResult(
@@ -2475,13 +2649,32 @@ def _compute_cylinder_residual_stats(
     radius: float,
 ) -> Tuple[float, float]:
     pts = np.asarray(points, dtype=float)
-    diff = pts - np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
     axis_dir = np.asarray(axis_dir, dtype=float).reshape(-1)
     axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
-    t = diff @ axis_dir
-    radial_vec = diff - np.outer(t, axis_dir)
-    radial_dist = np.linalg.norm(radial_vec, axis=1)
-    residuals = np.abs(radial_dist - float(radius))
+
+    residuals = None
+    if _gpu_enabled() and pts.size > 0:
+        try:
+            pts_t = _tensor_from_numpy(pts, device=_gpu_device())
+            axis_point_t = _tensor_from_numpy(axis_point, device=_gpu_device())
+            axis_dir_t = _tensor_from_numpy(axis_dir, device=_gpu_device())
+            axis_norm_t = (axis_dir_t * axis_dir_t).sum().sqrt()
+            axis_dir_t = axis_dir_t / axis_norm_t
+            diff_t = pts_t - axis_point_t
+            t_t = (diff_t * axis_dir_t).sum(axis=1)
+            radial_vec_t = diff_t - t_t.reshape((-1, 1)) * axis_dir_t
+            radial_dist_t = (radial_vec_t * radial_vec_t).sum(axis=1).sqrt()
+            residuals = (radial_dist_t - float(radius)).abs().cpu().numpy()
+        except Exception:
+            residuals = None
+
+    if residuals is None:
+        diff = pts - axis_point
+        t = diff @ axis_dir
+        radial_vec = diff - np.outer(t, axis_dir)
+        radial_dist = np.linalg.norm(radial_vec, axis=1)
+        residuals = np.abs(radial_dist - float(radius))
     if residuals.size == 0:
         return 0.0, 0.0
     median = float(np.median(residuals))
@@ -2504,7 +2697,20 @@ def compute_plane_residual_stats(
     if not np.isfinite(norm) or norm < 1e-12:
         return 0.0, 0.0
     plane_normal = plane_normal / norm
-    residuals = np.abs((pts - plane_point) @ plane_normal)
+    residuals = None
+    if _gpu_enabled() and pts.size > 0:
+        try:
+            pts_t = _tensor_from_numpy(pts, device=_gpu_device())
+            plane_point_t = _tensor_from_numpy(plane_point, device=_gpu_device())
+            plane_normal_t = _tensor_from_numpy(plane_normal, device=_gpu_device())
+            plane_norm_t = (plane_normal_t * plane_normal_t).sum().sqrt()
+            plane_normal_t = plane_normal_t / plane_norm_t
+            residuals = ((pts_t - plane_point_t) * plane_normal_t).sum(axis=1).abs().cpu().numpy()
+        except Exception:
+            residuals = None
+
+    if residuals is None:
+        residuals = np.abs((pts - plane_point) @ plane_normal)
     if residuals.size == 0:
         return 0.0, 0.0
     median = float(np.median(residuals))
@@ -3053,6 +3259,29 @@ def export_cylinder_diagnostics_ply(
             exported.append(path)
 
     return exported
+
+
+def score_cylinder_fit(
+    points: np.ndarray,
+    axis_point: np.ndarray,
+    axis_direction: np.ndarray,
+    radius: float,
+) -> Tuple[int, float]:
+    """Return (inlier_count, median_residual) for a cylinder fit."""
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) == 0:
+        return 0, float("inf")
+    axis_point = np.asarray(axis_point, dtype=float).reshape(-1)
+    axis_dir = np.asarray(axis_direction, dtype=float).reshape(-1)
+    axis_dir = axis_dir / np.maximum(np.linalg.norm(axis_dir), 1e-8)
+    diff = pts - axis_point
+    proj = diff @ axis_dir
+    radial = diff - np.outer(proj, axis_dir)
+    radial_dist = np.linalg.norm(radial, axis=1)
+    residual = np.abs(radial_dist - float(radius))
+    inlier_count = int(np.count_nonzero(np.isfinite(residual)))
+    median_res = float(np.median(residual)) if residual.size else float("inf")
+    return inlier_count, median_res
 
 
 def create_cylinder_mesh(
