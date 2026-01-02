@@ -3510,7 +3510,11 @@ class PrimitiveFittingApp:
                 roi_height = float(self._roi.get("height", 0.0))
             except Exception:
                 roi_height = None
-        result_cyl = self._apply_cylinder_plane_bounds(cyl_for_bounds, roi_height=roi_height)
+        result_cyl = self._apply_cylinder_plane_bounds(
+            cyl_for_bounds,
+            points=points_fit,
+            roi_height=roi_height,
+        )
         if result_cyl is None:
             self._set_status("地面/天井平面との整合に失敗しました。")
             return
@@ -3746,6 +3750,7 @@ class PrimitiveFittingApp:
         self,
         cyl: CylinderParam,
         *,
+        points: Optional[np.ndarray] = None,
         roi_height: Optional[float] = None,
     ) -> Optional[CylinderParam]:
         if cyl is None:
@@ -3758,6 +3763,38 @@ class PrimitiveFittingApp:
         axis_point = np.asarray(cyl.axis_point, dtype=float)
         length = float(cyl.length)
 
+        base_length = max(length, 1e-6)
+        t_min = -0.5 * base_length
+        t_max = 0.5 * base_length
+        has_inlier_range = False
+        if points is not None and cyl.inlier_indices is not None:
+            try:
+                idx = np.asarray(cyl.inlier_indices, dtype=int).reshape(-1)
+                if idx.size > 0:
+                    idx = idx[(idx >= 0) & (idx < len(points))]
+                if idx.size > 0:
+                    pts_in = np.asarray(points, dtype=float)[idx]
+                    t_vals = (pts_in - axis_point) @ axis_dir
+                    t_min = float(np.min(t_vals))
+                    t_max = float(np.max(t_vals))
+                    base_length = max(base_length, t_max - t_min)
+                    has_inlier_range = True
+            except Exception:
+                has_inlier_range = False
+        if base_length <= 1e-6 and roi_height is not None:
+            if np.isfinite(roi_height) and roi_height > 0:
+                base_length = float(roi_height)
+                t_min = -0.5 * base_length
+                t_max = 0.5 * base_length
+
+        if not has_inlier_range:
+            t_min = -0.5 * base_length
+            t_max = 0.5 * base_length
+
+        gate = max(0.2 * base_length, 0.05)
+        if roi_height is not None and np.isfinite(roi_height) and roi_height > 0:
+            gate = max(gate, 0.25 * float(roi_height))
+
         def intersect_t(plane: PlaneParam) -> Optional[float]:
             n = np.asarray(plane.normal, dtype=float)
             denom = float(np.dot(n, axis_dir))
@@ -3765,36 +3802,39 @@ class PrimitiveFittingApp:
                 return None
             return float(np.dot(n, np.asarray(plane.point, dtype=float) - axis_point) / denom)
 
+        def is_t_valid(t: float) -> bool:
+            return (t >= t_min - gate) and (t <= t_max + gate)
+
         ts = []
         ground_t = None
         ceiling_t = None
         if self.use_ground_plane.checked and self.ground_plane is not None:
             t = intersect_t(self.ground_plane)
-            if t is not None:
+            if t is not None and is_t_valid(t):
                 ts.append(t)
                 ground_t = t
         if self.use_ceiling_plane.checked and self.ceiling_plane is not None:
             t = intersect_t(self.ceiling_plane)
-            if t is not None:
+            if t is not None and is_t_valid(t):
                 ts.append(t)
                 ceiling_t = t
 
         if len(ts) == 0:
-            return cyl
+            return CylinderParam(
+                axis_point=axis_point,
+                axis_direction=axis_dir,
+                radius=float(cyl.radius),
+                length=float(base_length),
+                inlier_count=int(cyl.inlier_count),
+                inlier_indices=cyl.inlier_indices,
+            )
         if len(ts) == 1:
             t_plane = ts[0]
-            new_length = float(length)
-            if roi_height is not None and np.isfinite(roi_height) and roi_height > 0:
-                new_length = max(new_length, float(roi_height))
+            new_length = float(base_length)
             half = 0.5 * max(new_length, 1e-6)
-            if ground_t is not None and t_plane == ground_t:
-                target = -half
-            elif ceiling_t is not None and t_plane == ceiling_t:
-                target = half
-            else:
-                t_cap_minus = -half
-                t_cap_plus = half
-                target = t_cap_minus if abs(t_plane - t_cap_minus) <= abs(t_plane - t_cap_plus) else t_cap_plus
+            t_cap_minus = -half
+            t_cap_plus = half
+            target = t_cap_minus if abs(t_plane - t_cap_minus) <= abs(t_plane - t_cap_plus) else t_cap_plus
             shift = t_plane - target
             axis_point = axis_point + axis_dir * shift
             return CylinderParam(
