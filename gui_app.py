@@ -29,6 +29,8 @@ from primitives import (
     fit_cylinder_with_axis,
     recompute_cylinder_length_from_inliers,
     score_cylinder_fit,
+    robust_axis_from_cylinder_points,
+    center_weighted_sample,
 )
 
 
@@ -929,6 +931,17 @@ class PrimitiveFittingApp:
         self.fit_group.add_child(self._labeled_row("円柱しきい値", self.cylinder_threshold))
         self.fit_group.add_child(self._labeled_row("法線閾値(度)", self.normal_th))
 
+        self.cyl_preset = gui.Combobox()
+        self.cyl_preset.add_item("カスタム")
+        self.cyl_preset.add_item("細い柱 (φ≤10cm)")
+        self.cyl_preset.add_item("中くらいの柱 (φ10-30cm)")
+        self.cyl_preset.add_item("太い柱 (φ30cm-1m)")
+        self.cyl_preset.add_item("大きな円柱 (φ>1m)")
+        self.cyl_preset.add_item("高精度モード")
+        self.cyl_preset.selected_text = "カスタム"
+        self.cyl_preset.set_on_selection_changed(self._on_cyl_preset_changed)
+        self.fit_group.add_child(self._labeled_row("円柱プリセット", self.cyl_preset))
+
         self.auto_tune_cylinder = gui.Checkbox("円柱パラメータ自動調整")
         self.auto_tune_cylinder.checked = False
         self.fit_group.add_child(self.auto_tune_cylinder)
@@ -1308,9 +1321,26 @@ class PrimitiveFittingApp:
         self.results = {"planes": [], "cylinders": []}
         self._set_status("結果をクリアしました。")
 
+    def _modifier_state(self, event, modifier) -> Tuple[bool, bool]:
+        """Return (is_down, known) for a modifier key."""
+        try:
+            return bool(event.is_modifier_down(modifier)), True
+        except Exception:
+            pass
+        mods = getattr(event, "modifiers", None)
+        if mods is None:
+            return False, False
+        try:
+            return bool(mods & modifier), True
+        except Exception:
+            try:
+                return bool(mods & int(modifier)), True
+            except Exception:
+                return False, False
+
     def _on_mouse(self, event):
         self._last_mouse_pos = (int(event.x), int(event.y))
-        shift_down = event.is_modifier_down(gui.KeyModifier.SHIFT)
+        shift_down, _ = self._modifier_state(event, gui.KeyModifier.SHIFT)
         if self._transform_mode is not None and self._roi is not None:
             if event.type == gui.MouseEvent.Type.MOVE or event.type == gui.MouseEvent.Type.DRAG:
                 x_local, y_local, inside = self._event_to_widget_coords(event)
@@ -1391,22 +1421,7 @@ class PrimitiveFittingApp:
 
     def _on_key(self, event):
         if event.type == gui.KeyEvent.Type.DOWN:
-            shift_down = False
-            shift_known = False
-            try:
-                shift_down = bool(event.is_modifier_down(gui.KeyModifier.SHIFT))
-                shift_known = True
-            except Exception:
-                try:
-                    shift_down = bool(event.modifiers & gui.KeyModifier.SHIFT)
-                    shift_known = True
-                except Exception:
-                    try:
-                        shift_down = bool(event.modifiers & int(gui.KeyModifier.SHIFT))
-                        shift_known = True
-                    except Exception:
-                        shift_down = False
-                        shift_known = False
+            shift_down, shift_known = self._modifier_state(event, gui.KeyModifier.SHIFT)
             if event.key == gui.KeyName.A and (shift_down or not shift_known):
                 kind = "cylinder" if self.roi_add_combo.selected_text == "円柱" else "box"
                 self._create_roi(kind)
@@ -2829,6 +2844,67 @@ class PrimitiveFittingApp:
             return
         self._set_status(f"プロファイル保存: {path}")
 
+    def _on_cyl_preset_changed(self, text: str, _idx: int) -> None:
+        """Apply cylinder fitting preset parameters."""
+        presets = {
+            "細い柱 (φ≤10cm)": {
+                "cylinder_threshold": 0.01,
+                "normal_th": 25.0,
+                "roi_r_min": 0.05,
+                "roi_r_max": 0.2,
+                "roi_r_step": 0.02,
+                "grow_radius": 0.08,
+                "max_expand_radius": 2.0,
+            },
+            "中くらいの柱 (φ10-30cm)": {
+                "cylinder_threshold": 0.02,
+                "normal_th": 30.0,
+                "roi_r_min": 0.1,
+                "roi_r_max": 0.5,
+                "roi_r_step": 0.05,
+                "grow_radius": 0.15,
+                "max_expand_radius": 4.0,
+            },
+            "太い柱 (φ30cm-1m)": {
+                "cylinder_threshold": 0.03,
+                "normal_th": 35.0,
+                "roi_r_min": 0.3,
+                "roi_r_max": 1.2,
+                "roi_r_step": 0.1,
+                "grow_radius": 0.25,
+                "max_expand_radius": 6.0,
+            },
+            "大きな円柱 (φ>1m)": {
+                "cylinder_threshold": 0.05,
+                "normal_th": 40.0,
+                "roi_r_min": 1.0,
+                "roi_r_max": 3.0,
+                "roi_r_step": 0.2,
+                "grow_radius": 0.4,
+                "max_expand_radius": 10.0,
+            },
+            "高精度モード": {
+                "cylinder_threshold": 0.008,
+                "normal_th": 20.0,
+                "roi_r_min": 0.15,
+                "roi_r_max": 0.8,
+                "roi_r_step": 0.05,
+                "grow_radius": 0.1,
+                "max_expand_radius": 3.0,
+            },
+        }
+        preset = presets.get(text)
+        if preset is None:
+            return
+        self.cylinder_threshold.double_value = preset["cylinder_threshold"]
+        self.normal_th.double_value = preset["normal_th"]
+        self.roi_r_min.double_value = preset["roi_r_min"]
+        self.roi_r_max.double_value = preset["roi_r_max"]
+        self.roi_r_step.double_value = preset["roi_r_step"]
+        self.grow_radius.double_value = preset["grow_radius"]
+        self.max_expand_radius.double_value = preset["max_expand_radius"]
+        self._set_status(f"プリセット '{text}' を適用しました。")
+
     def _clear_ground_plane(self):
         if self._ground_name is not None:
             self._remove_object(self._ground_name)
@@ -3160,11 +3236,13 @@ class PrimitiveFittingApp:
                 sample_points = points_fit
                 sample_normals = normals_fit
                 max_sample = 20000
-                if points is not None and len(points) > max_sample:
-                    indices = self._rng.choice(len(points_fit), size=max_sample, replace=False)
+                if points_fit is not None and len(points_fit) > max_sample:
+                    indices = center_weighted_sample(points_fit, seed_center, max_samples=max_sample)
                     sample_points = points_fit[indices]
                     if normals_fit is not None and len(normals_fit) == len(points_fit):
                         sample_normals = normals_fit[indices]
+                    else:
+                        sample_normals = None
                 radius_min = 0.01
                 radius_max = 1.0
                 if self._roi.get("type") == "cylinder":
@@ -3178,36 +3256,35 @@ class PrimitiveFittingApp:
                     radius_min = max(0.4 * radius, 0.01)
                     radius_max = max(1.6 * radius, radius_min + 0.02)
 
-                candidates = []
-                try:
-                    if sample_normals is not None and len(sample_normals) >= 6:
-                        normals_unit = sample_normals / np.maximum(
-                            np.linalg.norm(sample_normals, axis=1, keepdims=True), 1e-8
-                        )
-                        cov = normals_unit.T @ normals_unit
-                        _, _, vh = np.linalg.svd(cov, full_matrices=False)
-                        candidates.append(vh[-1])
-                except Exception:
-                    pass
+                candidates: List[Tuple[np.ndarray, str, float]] = []
+                include_vertical = self.ground_plane is not None
+                vertical_axis = None
+                if self.ground_plane is not None:
+                    try:
+                        vertical_axis = np.asarray(self.ground_plane.normal, dtype=float)
+                    except Exception:
+                        vertical_axis = None
                 if sample_points is not None and len(sample_points) >= 6:
-                    centered = sample_points - sample_points.mean(axis=0)
-                    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-                    candidates.append(vh[0])
+                    candidates = robust_axis_from_cylinder_points(
+                        sample_points,
+                        sample_normals,
+                        include_vertical=include_vertical,
+                        vertical_axis=vertical_axis,
+                    )
+                roi_axis = None
                 if self._roi is not None and self._roi.get("type") == "cylinder":
                     roi_rot = np.asarray(self._roi.get("rotation", np.eye(3)), dtype=float)
-                    candidates.append(roi_rot[:, 2])
-                if self.ground_plane is not None:
-                    candidates.append(np.asarray(self.ground_plane.normal, dtype=float))
-                if sample_points is not None and len(sample_points) >= 30:
-                    for _ in range(3):
-                        idx = self._rng.choice(len(sample_points), size=30, replace=False)
-                        centered = sample_points[idx] - sample_points[idx].mean(axis=0)
-                        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-                        candidates.append(vh[0])
+                    roi_axis = roi_rot[:, 2]
+                if self.roi_axis_lock_checkbox.checked and roi_axis is not None:
+                    candidates = [(roi_axis, "roi_axis", 0.95)]
+                if not candidates and sample_points is not None and len(sample_points) >= 6:
+                    centered = sample_points - sample_points.mean(axis=0)
+                    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                    candidates = [(vh[0], "pca0", 0.5)]
 
                 best_score = -1.0
                 best_cyl = None
-                for axis_prior in candidates:
+                for axis_prior, source, confidence in candidates:
                     axis_norm = np.linalg.norm(axis_prior)
                     if not np.isfinite(axis_norm) or axis_norm <= 1e-8:
                         continue
@@ -3227,7 +3304,15 @@ class PrimitiveFittingApp:
                         cand.axis_direction,
                         cand.radius,
                     )
-                    score = float(inliers) / max(float(median_res), 1e-6)
+                    base_score = float(inliers) / max(float(median_res), 1e-6)
+                    score = base_score * (0.7 + 0.3 * float(confidence))
+                    if source in ("ransac", "normals", "trimmed_pca"):
+                        score *= 1.15
+                    elif source == "vertical":
+                        if vertical_axis is not None:
+                            cos_vert = abs(np.dot(cand.axis_direction, vertical_axis))
+                            if cos_vert > 0.95:
+                                score *= 1.1
                     if score > best_score:
                         best_score = score
                         best_cyl = cand
