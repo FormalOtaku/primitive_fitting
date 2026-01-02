@@ -17,6 +17,9 @@ seed_expand_results.json
 stairs_results.json
 *.ply
 *.obj
+crash.log
+BuildErroLOG
+Screenshot/
 
 # local work dir
 work/
